@@ -2,7 +2,13 @@ import { useState, useEffect, useRef } from 'react';
 import { Dialog, DialogContent } from '@/components/ui/dialog';
 import { Phone, PhoneOff, Mic, Volume2 } from 'lucide-react';
 import { io, type Socket } from 'socket.io-client';
-import { getCallStatus, getCallBackendUrl, getTranscripts } from '@/lib/chatApi';
+import {
+  CALL_STATUS_SESSION_GRACE_MS,
+  getCallStatusWithMeta,
+  getCallBackendUrl,
+  getTranscripts,
+  isCallEndedStatus,
+} from '@/lib/chatApi';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
 
 interface TranscriptLine {
@@ -122,22 +128,34 @@ export function LiveTranscriptModal({
   const [isLoadingTranscriptAfterEnd, setIsLoadingTranscriptAfterEnd] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const callDurationRef = useRef(0);
+  /** Latest lines for finishCall when the HTTP poll returns [] but Socket.io already filled the transcript. */
+  const transcriptSnapshotRef = useRef<TranscriptLine[]>([]);
+  const onCallCompleteRef = useRef(onCallComplete);
+  onCallCompleteRef.current = onCallComplete;
+  transcriptSnapshotRef.current = transcript;
   const useRealTranscript = Boolean(callId);
   const callStatusOpts = { callBackendToken: callBackendToken ?? undefined };
 
   callDurationRef.current = callDuration;
 
-  // Reset state when modal opens; if we have stored transcript, show it immediately
+  // Reset state when modal opens; if we have stored transcript, show it immediately.
+  // Only show "Call ended" when we have both transcript and duration (call was already ended); otherwise keep "Call in progress" until we get call_ended from backend.
   useEffect(() => {
     if (open) {
       const raw = initialTranscript;
       const stored = (typeof raw === 'string' ? raw : '').trim();
+      const hasEndedDuration = initialCallDuration != null && String(initialCallDuration).trim() !== '';
       if (stored) {
         setTranscript(parseStoredTranscript(stored));
-        setIsCallActive(false);
-        setCallDuration(initialCallDuration != null ? parseDurationToSeconds(String(initialCallDuration)) : 0);
         setCurrentLineIndex(0);
         setIsCurrentLineTyping(false);
+        if (hasEndedDuration) {
+          setIsCallActive(false);
+          setCallDuration(parseDurationToSeconds(String(initialCallDuration)));
+        } else {
+          setIsCallActive(true);
+          setCallDuration(0);
+        }
       } else {
         setTranscript([]);
         setCurrentLineIndex(0);
@@ -167,7 +185,9 @@ export function LiveTranscriptModal({
     let socket: Socket | null = null;
     let intervalId: ReturnType<typeof setInterval> | null = null;
     const retryTimeouts: ReturnType<typeof setTimeout>[] = [];
+    const sessionStartedAtMs = Date.now();
     const duration = () => callDurationRef.current;
+    const pastStatusGrace = () => Date.now() - sessionStartedAtMs >= CALL_STATUS_SESSION_GRACE_MS;
 
     const clearRetries = () => {
       retryTimeouts.forEach(clearTimeout);
@@ -175,6 +195,7 @@ export function LiveTranscriptModal({
     };
 
     const applyTranscript = (lines: TranscriptLine[]) => {
+      transcriptSnapshotRef.current = lines;
       setTranscript(lines);
     };
 
@@ -190,8 +211,15 @@ export function LiveTranscriptModal({
         socket = null;
       }
       setIsCallActive(false);
-      const summary = lines.map((l) => `${l.speaker === 'ai' ? 'AI' : 'Customer'}: ${l.text}`).join('\n');
-      onCallComplete(
+      const effective =
+        lines.length > 0 ? lines : transcriptSnapshotRef.current;
+      if (effective.length > 0 && lines.length === 0) {
+        setTranscript(effective);
+      }
+      const summary = effective
+        .map((l) => `${l.speaker === 'ai' ? 'AI' : 'Customer'}: ${l.text}`)
+        .join('\n');
+      onCallCompleteRef.current(
         summary.slice(0, 200) || 'Call completed',
         summary || 'Transcript',
         formatDuration(finalDurationSec)
@@ -203,8 +231,6 @@ export function LiveTranscriptModal({
       text: (t.content ?? t.text ?? t.message ?? '').trim(),
       timestamp: t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : formatDuration(duration()),
     });
-
-    const isEndedStatus = (s: string) => s === 'ended' || s === 'done' || s === 'completed';
 
     /** Fetch transcript after call ended; backend may need a few seconds to persist. Retries with backoff. */
     const fetchTranscriptAfterEnd = async (
@@ -223,9 +249,13 @@ export function LiveTranscriptModal({
               timestamp: t.timestamp ? new Date(t.timestamp).toLocaleTimeString() : '',
             }));
           }
-          const status = await getCallStatus(callId, callStatusOpts);
-          if (status?.transcript?.length) {
-            return status.transcript.map((t) => toTranscriptLine(t));
+          const meta = await getCallStatusWithMeta(callId, callStatusOpts);
+          if (!meta.ok) {
+            if (meta.callNotFound && pastStatusGrace()) return [];
+            continue;
+          }
+          if (meta.data.transcript?.length) {
+            return meta.data.transcript.map((t) => toTranscriptLine(t));
           }
         }
         return [];
@@ -235,11 +265,20 @@ export function LiveTranscriptModal({
     };
 
     const poll = async () => {
-      const status = await getCallStatus(callId, callStatusOpts);
-      if (!status) return;
+      const meta = await getCallStatusWithMeta(callId, callStatusOpts);
+      if (!meta.ok) {
+        // Early 404: call row may not exist yet. Do not finishCall — that was resolving at 0:00 with empty transcript.
+        if (meta.callNotFound && pastStatusGrace()) {
+          finishCall([], duration());
+        }
+        // Transient 502 / network: keep polling; never auto-close modal on failure bursts (staggered poll + socket retry used to hit 3x in ~3s).
+        return;
+      }
+      const status = meta.data;
       const lines: TranscriptLine[] = (status.transcript || []).map((t) => toTranscriptLine(t));
-      applyTranscript(lines);
-      if (isEndedStatus(status.status)) {
+      // Never replace a live Socket.io transcript with an empty poll result — status API often omits transcript after end.
+      if (lines.length > 0) applyTranscript(lines);
+      if (isCallEndedStatus(status.status)) {
         const finalDuration = status.endedAt && status.startedAt
           ? Math.floor((new Date(status.endedAt).getTime() - new Date(status.startedAt).getTime()) / 1000)
           : duration();
@@ -274,7 +313,7 @@ export function LiveTranscriptModal({
               ? Math.max(0, Math.floor((new Date(lastTs).getTime() - new Date(firstTs).getTime()) / 1000))
               : duration();
           setCallDuration(finalDuration);
-          setIsCallActive(false);
+          // Do not set isCallActive to false here — transcript may be partial for an ongoing call; only socket/poll call_ended or status ended should mark call as ended.
           return true;
         }
         if (attempt < 2) {
@@ -308,13 +347,20 @@ export function LiveTranscriptModal({
 
           // Single-segment events (backend may emit transcript_line or transcript with one segment)
           const appendSegment = (t: Record<string, unknown>) => {
-            setTranscript((prev) => [...prev, toTranscriptLine({
-              role: t.role as string,
-              content: t.content as string,
-              text: t.text as string,
-              message: t.message as string,
-              timestamp: t.timestamp as string,
-            })]);
+            setTranscript((prev) => {
+              const next = [
+                ...prev,
+                toTranscriptLine({
+                  role: t.role as string,
+                  content: t.content as string,
+                  text: t.text as string,
+                  message: t.message as string,
+                  timestamp: t.timestamp as string,
+                }),
+              ];
+              transcriptSnapshotRef.current = next;
+              return next;
+            });
           };
 
           socket.on('transcript_line', (payload: unknown) => {
@@ -361,14 +407,18 @@ export function LiveTranscriptModal({
               typeof item === 'object' && item !== null ? item as Record<string, unknown> : {}
             ));
             if (lines.length) applyTranscript(lines);
-            const isEnded = statusVal === 'ended' || statusVal === 'done' || statusVal === 'completed';
+            const isEnded = isCallEndedStatus(statusVal);
             if (isEnded) {
               const started = d.started_at ?? d.startedAt ?? d.start;
               const ended = d.ended_at ?? d.endedAt ?? d.end;
-              const payloadDuration = typeof d.duration === 'number' ? d.duration : undefined;
-              const finalDuration = started && ended
-                ? Math.floor((new Date(ended as string).getTime() - new Date(started as string).getTime()) / 1000)
-                : (payloadDuration ?? duration());
+              const payloadDuration = typeof d.duration === 'number' ? d.duration : 0;
+              const fromClock =
+                started && ended
+                  ? Math.floor(
+                      (new Date(ended as string).getTime() - new Date(started as string).getTime()) / 1000,
+                    )
+                  : payloadDuration;
+              const finalDuration = Math.max(fromClock, duration());
               if (lines.length > 0) {
                 finishCall(lines, finalDuration);
               } else {
@@ -386,7 +436,8 @@ export function LiveTranscriptModal({
           // Strong "call ended" signal from backend (CREATE_CALL_API.md § Getting Live Transcripts).
           socket.on('call_ended', (payload?: unknown) => {
             const data = (typeof payload === 'object' && payload !== null ? payload : {}) as CallEndedPayload & Record<string, unknown>;
-            const finalDuration = typeof data.duration === 'number' ? data.duration : duration();
+            const payloadDur = typeof data.duration === 'number' ? data.duration : 0;
+            const finalDuration = Math.max(payloadDur, duration());
             setCallDuration(finalDuration);
             // Apply transcript if backend included it (optional; often sent via transcript/call_status)
             const rawTranscript = data.transcript ?? data.lines;
@@ -432,7 +483,7 @@ export function LiveTranscriptModal({
       }
       setIsLoadingTranscriptAfterEnd(false);
     };
-  }, [open, callId, useRealTranscript, initialTranscript, onCallComplete, callBackendToken]);
+  }, [open, callId, useRealTranscript, initialTranscript, callBackendToken]);
 
   // Scripted transcript: add lines progressively (when no callId)
   useEffect(() => {
@@ -611,11 +662,10 @@ export function LiveTranscriptModal({
           {/* Call ended message */}
           {!isCallActive && (
             <div className="flex flex-col items-center justify-center py-6 text-gray-500">
-              <div className="p-3 bg-green-100 rounded-full mb-3">
-                <Phone className="w-6 h-6 text-green-600" />
-              </div>
               <p className="text-sm font-medium text-green-600">Call completed successfully</p>
-              <p className="text-xs text-gray-400 mt-1">Quote received: $189</p>
+              {transcript.length > 0 && (
+                <p className="text-xs text-gray-400 mt-1">Transcript is saved to this task.</p>
+              )}
             </div>
           )}
         </div>

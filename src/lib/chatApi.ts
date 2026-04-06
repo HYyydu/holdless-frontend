@@ -21,6 +21,8 @@ export interface ChatResponse {
 export interface GetChatResponseOptions {
   /** JWT from call-backend sign-in. Sent as Authorization: Bearer. Required for placing calls when backend uses per-user auth. */
   callBackendToken?: string | null;
+  /** User's profile name (from Profile tab). Sent so the AI can suggest it when asking for the call name; user can override by typing a different name. */
+  profileName?: string | null;
 }
 
 /**
@@ -36,10 +38,16 @@ export async function getChatResponse(
   const token = options?.callBackendToken?.trim();
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const body: { messages: ChatMessage[]; callBackendToken?: string } = {
+  const body: {
+    messages: ChatMessage[];
+    callBackendToken?: string;
+    profileName?: string;
+  } = {
     messages,
   };
   if (token) body.callBackendToken = token;
+  const profileName = options?.profileName?.trim();
+  if (profileName) body.profileName = profileName;
 
   try {
     const res = await fetch("/api/chat", {
@@ -73,6 +81,85 @@ export interface CallStatus {
 export interface GetCallStatusOptions {
   /** JWT from call-backend sign-in. Sent as Authorization: Bearer. */
   callBackendToken?: string | null;
+}
+
+/**
+ * After placing a call, GET /api/calls/:id may 404 briefly before the record exists.
+ * Ignore "call not found" for this long after opening the transcript / detail poller so we don't resolve at call start.
+ */
+export const CALL_STATUS_SESSION_GRACE_MS = 60_000;
+
+/** True when the call backend reports a finished call (case-insensitive). */
+export function isCallEndedStatus(status: string | undefined | null): boolean {
+  const v = String(status ?? "").toLowerCase().trim();
+  return (
+    v === "ended" ||
+    v === "done" ||
+    v === "completed" ||
+    v === "complete" ||
+    v === "finished" ||
+    v === "failed" ||
+    v === "cancelled" ||
+    v === "canceled"
+  );
+}
+
+export type GetCallStatusMetaResult =
+  | { ok: true; data: CallStatus }
+  | {
+      ok: false;
+      /** Call backend / proxy says this id no longer exists — UI should stop "ongoing" polling. */
+      callNotFound: boolean;
+      httpStatus: number;
+      message?: string;
+    };
+
+/**
+ * Same as getCallStatus but preserves HTTP / error shape so callers can treat "call not found" as terminal.
+ */
+export async function getCallStatusWithMeta(
+  callId: string,
+  options?: GetCallStatusOptions,
+): Promise<GetCallStatusMetaResult> {
+  const headers: Record<string, string> = {};
+  const token = options?.callBackendToken?.trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  try {
+    const res = await fetch(`/api/call/${callId}`, { headers });
+    let data: Record<string, unknown> = {};
+    try {
+      data = (await res.json()) as Record<string, unknown>;
+    } catch {
+      data = {};
+    }
+    const errStr = String(data.error ?? data.message ?? "").trim();
+    const looksNotFound =
+      /not\s*found|call not found|unknown call|invalid call/i.test(errStr);
+
+    if (!res.ok) {
+      const callNotFound =
+        res.status === 404 || (res.status === 502 && looksNotFound);
+      return {
+        ok: false,
+        callNotFound,
+        httpStatus: res.status,
+        message: errStr || undefined,
+      };
+    }
+    if (data.error != null) {
+      return {
+        ok: false,
+        callNotFound: looksNotFound,
+        httpStatus: res.status,
+        message: errStr || undefined,
+      };
+    }
+    return { ok: true, data: data as CallStatus };
+  } catch (e) {
+    console.warn("Call status request failed:", e);
+    return { ok: false, callNotFound: false, httpStatus: 0 };
+  }
 }
 
 /** Single transcript segment from GET /api/calls/:id/transcripts */
@@ -138,20 +225,8 @@ export async function getCallStatus(
   callId: string,
   options?: GetCallStatusOptions,
 ): Promise<CallStatus | null> {
-  const headers: Record<string, string> = {};
-  const token = options?.callBackendToken?.trim();
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  try {
-    const res = await fetch(`/api/call/${callId}`, { headers });
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (data.error) return null;
-    return data as CallStatus;
-  } catch (e) {
-    console.warn("Call status request failed:", e);
-    return null;
-  }
+  const r = await getCallStatusWithMeta(callId, options);
+  return r.ok ? r.data : null;
 }
 
 export interface SummarizeCallOptions extends GetCallStatusOptions {
@@ -160,15 +235,23 @@ export interface SummarizeCallOptions extends GetCallStatusOptions {
 }
 
 /**
+ * Result of summarizeCall. usefulInfoObtained is false when the call did not obtain the requested info (e.g. no price given).
+ */
+export interface SummarizeCallResult {
+  summary: string;
+  usefulInfoObtained?: boolean;
+}
+
+/**
  * Request AI summarization of a call with respect to its purpose.
- * POST /api/call/:callId/summarize — returns { summary } or null on error.
+ * POST /api/call/:callId/summarize — returns { summary, usefulInfoObtained } or null on error.
  * Pass options.transcript when you already have the transcript (e.g. from the transcript modal) so the server doesn't need to wait for the call backend.
  */
 export async function summarizeCall(
   callId: string,
   purpose: string,
   options?: SummarizeCallOptions,
-): Promise<{ summary: string } | null> {
+): Promise<SummarizeCallResult | null> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   const token = options?.callBackendToken?.trim();
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -183,9 +266,49 @@ export async function summarizeCall(
     if (!res.ok) return null;
     const data = await res.json();
     if (data.error) return null;
-    return { summary: data.summary ?? "" };
+    return {
+      summary: data.summary ?? "",
+      usefulInfoObtained: Object.prototype.hasOwnProperty.call(data, "usefulInfoObtained")
+        ? Boolean(data.usefulInfoObtained)
+        : true,
+    };
   } catch (e) {
     console.warn("summarizeCall failed", e);
+    return null;
+  }
+}
+
+/**
+ * Retry a call with the same phone and purpose (e.g. when the first call did not obtain useful information).
+ * POST /api/call/retry — body: { callId, purpose, phone_number? }. Returns { callId: newCallId } or null.
+ * Only intended for one retry per task.
+ */
+export async function retryCall(
+  callId: string,
+  purpose: string,
+  options?: GetCallStatusOptions & { phone_number?: string | null },
+): Promise<{ callId: string } | null> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = options?.callBackendToken?.trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const body: { callId: string; purpose: string; phone_number?: string } = {
+    callId,
+    purpose: purpose || "",
+  };
+  if (options?.phone_number != null && options.phone_number !== "")
+    body.phone_number = options.phone_number;
+  try {
+    const res = await fetch("/api/call/retry", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.error) return null;
+    return data.callId ? { callId: data.callId } : null;
+  } catch (e) {
+    console.warn("retryCall failed", e);
     return null;
   }
 }

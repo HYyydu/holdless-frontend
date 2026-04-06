@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { ArrowLeft, Plus, Send, Star } from "lucide-react";
 import { Input } from "@/components/ui/input";
-import holdlessHLogo from "@/assets/holdless-h-logo-purple.png";
 import { getChatResponse, getCallStatus, sendChatMessage } from "@/lib/chatApi";
 import { useDemoAuth } from "@/contexts/DemoAuthContext";
 import { useCallBackendAuth } from "@/contexts/CallBackendAuthContext";
+import { useUserProfile } from "@/hooks/useUserProfile";
 interface Message {
   id: string;
   role: "user" | "assistant" | "thinking";
@@ -164,7 +164,7 @@ const ThinkingIndicator = () => (
   <div className="flex gap-4">
     <div className="w-8 h-8 rounded-full overflow-hidden flex-shrink-0">
       <img
-        src={holdlessHLogo}
+        src="/lovable-uploads/554fdd18-2418-4c33-a52e-2119f3a6f315.png"
         alt="Holdless"
         className="w-full h-full object-cover"
       />
@@ -204,11 +204,15 @@ export function ConversationView({
 }: ConversationViewProps) {
   const { user } = useDemoAuth();
   const { callBackendToken } = useCallBackendAuth();
+  const { profile } = useUserProfile();
   const userId = user?.id ?? "anonymous";
   const conversationIdRef = useRef<string | null>(
     initialConversationId ?? null,
   );
-  const chatOpts = { callBackendToken: callBackendToken ?? undefined };
+  const chatOpts = {
+    callBackendToken: callBackendToken ?? undefined,
+    profileName: profile?.name?.trim() || undefined,
+  };
 
   const initialMsgs: Message[] = initialMessages?.length
     ? initialMessages.map((m, i) => ({
@@ -670,7 +674,7 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     <div className="flex gap-4">
       <div className="w-8 h-8 rounded-full overflow-hidden flex-shrink-0">
         <img
-          src={holdlessHLogo}
+          src="/lovable-uploads/554fdd18-2418-4c33-a52e-2119f3a6f315.png"
           alt="Holdless"
           className="w-full h-full object-cover"
         />

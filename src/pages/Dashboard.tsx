@@ -26,7 +26,7 @@ import { usePets } from '@/hooks/usePets';
 import { useTasks, taskToPayload } from '@/hooks/useTasks';
 import { useDemoAuth } from '@/contexts/DemoAuthContext';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
-import { summarizeCall } from '@/lib/chatApi';
+import { summarizeCall, retryCall } from '@/lib/chatApi';
 
 // Sample data with vendor logos
 const sampleTasks: Task[] = [
@@ -323,9 +323,37 @@ const Dashboard = () => {
       await updateCallTaskByCallId(callId, status, payloadPatch);
     } else {
       setCallTasks((prev) =>
-        prev.map((t) => (t.callId === callId ? { ...t, status } : t))
+        prev.map((t) => {
+          if (t.callId !== callId) return t;
+          const nextPayload = { ...t.payload, ...payloadPatch };
+          const nextCallId =
+            payloadPatch?.callId != null
+              ? String(payloadPatch.callId)
+              : t.callId;
+          return { ...t, status, callId: nextCallId, payload: nextPayload };
+        })
       );
     }
+  };
+
+  const handleRetryCall = async (
+    callId: string,
+    purpose: string
+  ): Promise<{ newCallId: string } | null> => {
+    const task = callTasks.find((t) => t.callId === callId);
+    if (!task) return null;
+    const result = await retryCall(callId, purpose, {
+      callBackendToken: callBackendToken ?? undefined,
+      phone_number: (task.payload?.phone_number as string) ?? undefined,
+    });
+    if (!result) return null;
+    const mergedPayload = {
+      ...(task.payload || {}),
+      callId: result.callId,
+      hasRetried: true,
+    };
+    await handleCallTaskStatusUpdate(callId, 'in_progress', mergedPayload);
+    return { newCallId: result.callId };
   };
 
   const handleUpdateProfile = (field: string, value: string) => {
@@ -470,9 +498,11 @@ const Dashboard = () => {
               if (result?.summary) {
                 await handleCallTaskStatusUpdate(callId, 'resolved', {
                   callSummary: result.summary,
+                  usefulInfoObtained: result.usefulInfoObtained,
                 });
               }
             }}
+            onRetryCall={handleRetryCall}
           />
         )}
 
@@ -617,6 +647,7 @@ const Dashboard = () => {
               if (result?.summary) {
                 await handleCallTaskStatusUpdate(callId, 'resolved', {
                   callSummary: result.summary,
+                  usefulInfoObtained: result.usefulInfoObtained,
                 });
               }
             }

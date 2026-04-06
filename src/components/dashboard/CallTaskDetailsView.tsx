@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
-import { ArrowLeft, Phone, FileText, CheckCircle, Clock, RefreshCw, MessageSquare } from 'lucide-react';
-import { getCallStatus } from '@/lib/chatApi';
+import { ArrowLeft, Phone, FileText, CheckCircle, Clock, RefreshCw, MessageSquare, AlertCircle } from 'lucide-react';
+import {
+  CALL_STATUS_SESSION_GRACE_MS,
+  getCallStatusWithMeta,
+  isCallEndedStatus,
+} from '@/lib/chatApi';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
 import type { CallTask } from './ConversationView';
 
@@ -10,31 +14,143 @@ interface CallTaskDetailsViewProps {
   onWatchTranscript: (callId: string, label: string) => void;
   /** When call is detected as ended (e.g. via polling), update task to resolved */
   onCallEnded?: (callId: string) => void;
+  /** Retry the call with same purpose (once). Called when user clicks Retry after no useful info was obtained. */
+  onRetryCall?: (callId: string, purpose: string) => Promise<{ newCallId: string } | null>;
 }
 
-function isEndedStatus(s: string): boolean {
-  return s === 'ended' || s === 'done' || s === 'completed';
+const NO_TRANSCRIPT_MSG =
+  'No transcript available for this call. Summary will appear after the call is processed.';
+
+/** After this many consecutive failed status polls (e.g. TLS ECONNRESET to call backend), treat task as ended. */
+const STATUS_POLL_FAILURES_BEFORE_RESOLVE = 3;
+
+function SummarySection({
+  task,
+  isOngoing,
+  onRetryCall,
+}: {
+  task: CallTask;
+  isOngoing: boolean;
+  onRetryCall?: (callId: string, purpose: string) => Promise<{ newCallId: string } | null>;
+}) {
+  const [retrying, setRetrying] = useState(false);
+  const summary = task.callSummary ?? task.payload?.callSummary;
+  const summaryStr = typeof summary === 'string' ? summary : '';
+  const usefulInfoObtained = task.payload?.usefulInfoObtained !== false;
+  const hasRetried = task.payload?.hasRetried === true;
+  const showRetry =
+    !isOngoing &&
+    summaryStr &&
+    summaryStr !== NO_TRANSCRIPT_MSG &&
+    usefulInfoObtained === false &&
+    hasRetried !== true &&
+    onRetryCall;
+
+  const handleRetry = async () => {
+    if (!onRetryCall || !task.callId) return;
+    setRetrying(true);
+    try {
+      await onRetryCall(task.callId, task.description || task.title || '');
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
+      <div className="flex items-center gap-2 mb-5">
+        <CheckCircle className="w-5 h-5 text-gray-600" />
+        <h2 className="text-lg font-semibold text-gray-900">Summary</h2>
+      </div>
+      <div className="min-h-[80px] text-gray-700 text-sm leading-relaxed space-y-4">
+        {summaryStr ? (
+          summaryStr
+        ) : (
+          <span className="text-gray-400">
+            {isOngoing
+              ? 'Summary will appear after the call ends.'
+              : 'No summary available for this call.'}
+          </span>
+        )}
+        {showRetry && (
+          <div className="pt-2 border-t border-gray-100">
+            <p className="flex items-center gap-2 text-amber-700 text-sm mb-3">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              We didn’t get the information we needed during this call. Do you want to retry?
+            </p>
+            <button
+              type="button"
+              onClick={handleRetry}
+              disabled={retrying}
+              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 disabled:opacity-60 transition-colors"
+            >
+              <RefreshCw className={`w-4 h-4 ${retrying ? 'animate-spin' : ''}`} />
+              {retrying ? 'Retrying…' : 'Retry call'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
-export function CallTaskDetailsView({ task, onBack, onWatchTranscript, onCallEnded }: CallTaskDetailsViewProps) {
+export function CallTaskDetailsView({ task, onBack, onWatchTranscript, onCallEnded, onRetryCall }: CallTaskDetailsViewProps) {
   const { callBackendToken } = useCallBackendAuth();
   const [isOngoing, setIsOngoing] = useState(task.status === 'in_progress');
   const onCallEndedRef = useRef(onCallEnded);
   onCallEndedRef.current = onCallEnded;
+  const statusPollFailuresRef = useRef(0);
 
   // Poll call status when task shows in progress so we detect call_ended even if transcript modal wasn't open
   useEffect(() => {
     if (task.status !== 'in_progress' || !task.callId) return;
+    statusPollFailuresRef.current = 0;
+    const openedAtMs = Date.now();
+    const taskCreatedMs =
+      task.createdAt instanceof Date && !Number.isNaN(task.createdAt.getTime())
+        ? task.createdAt.getTime()
+        : openedAtMs;
+    const pastSessionGrace = () => Date.now() - openedAtMs >= CALL_STATUS_SESSION_GRACE_MS;
+    const taskOlderThanGrace = () => Date.now() - taskCreatedMs >= CALL_STATUS_SESSION_GRACE_MS;
+
     const opts = { callBackendToken: callBackendToken ?? undefined };
-    const intervalId = setInterval(async () => {
-      const status = await getCallStatus(task.callId, opts);
-      if (status && isEndedStatus(status.status)) {
+    const tick = async () => {
+      const meta = await getCallStatusWithMeta(task.callId, opts);
+      if (meta.ok) {
+        statusPollFailuresRef.current = 0;
+        if (isCallEndedStatus(meta.data.status)) {
+          setIsOngoing(false);
+          onCallEndedRef.current?.(task.callId);
+        }
+        return;
+      }
+      // 404 can appear before the call row exists; only trust "not found" for an older task or after grace.
+      if (meta.callNotFound) {
+        statusPollFailuresRef.current = 0;
+        if (taskOlderThanGrace() || pastSessionGrace()) {
+          setIsOngoing(false);
+          onCallEndedRef.current?.(task.callId);
+        }
+        return;
+      }
+      // Unreachable call backend: count only after grace (or stale task) so we don't resolve a brand-new call on blips.
+      if (!pastSessionGrace() && !taskOlderThanGrace()) return;
+      statusPollFailuresRef.current += 1;
+      if (statusPollFailuresRef.current >= STATUS_POLL_FAILURES_BEFORE_RESOLVE) {
+        statusPollFailuresRef.current = 0;
         setIsOngoing(false);
         onCallEndedRef.current?.(task.callId);
       }
-    }, 4000);
+    };
+    void tick();
+    const intervalId = setInterval(() => void tick(), 4000);
     return () => clearInterval(intervalId);
-  }, [task.status, task.callId, callBackendToken]);
+  }, [
+    task.status,
+    task.callId,
+    callBackendToken,
+    task.createdAt instanceof Date ? task.createdAt.getTime() : 0,
+  ]);
 
   // Sync isOngoing when task prop changes (e.g. after parent updated from modal's onCallComplete)
   useEffect(() => {
@@ -190,23 +306,11 @@ export function CallTaskDetailsView({ task, onBack, onWatchTranscript, onCallEnd
           </div>
 
           {/* 3. AI call summary (with respect to purpose) */}
-          <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
-            <div className="flex items-center gap-2 mb-5">
-              <CheckCircle className="w-5 h-5 text-gray-600" />
-              <h2 className="text-lg font-semibold text-gray-900">Summary</h2>
-            </div>
-            <div className="min-h-[80px] text-gray-700 text-sm leading-relaxed">
-              {(task.callSummary ?? task.payload?.callSummary) ? (
-                (task.callSummary ?? String(task.payload?.callSummary))
-              ) : (
-                <span className="text-gray-400">
-                  {isOngoing
-                    ? 'Summary will appear after the call ends.'
-                    : 'No summary available for this call.'}
-                </span>
-              )}
-            </div>
-          </div>
+          <SummarySection
+            task={task}
+            isOngoing={isOngoing}
+            onRetryCall={onRetryCall}
+          />
         </div>
       </div>
     </div>

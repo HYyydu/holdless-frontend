@@ -27,6 +27,8 @@ interface TasksViewProps {
   onWatchTranscript?: (callId: string, label: string) => void;
   /** When call ends (e.g. detected via polling), update task to resolved */
   onCallEnded?: (callId: string) => void;
+  /** Retry the call with same purpose (e.g. when no useful info was obtained). Returns new callId or null. */
+  onRetryCall?: (callId: string, purpose: string) => Promise<{ newCallId: string } | null>;
 }
 
 const sampleTasks: Task[] = [
@@ -76,6 +78,12 @@ const formatDate = (date: Date) => {
     return '—';
   }
 };
+
+/** Format task title (e.g. general_business → General Business) for display. */
+function formatTaskTitle(title: string): string {
+  if (!title || typeof title !== 'string') return title ?? '';
+  return title.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
 
 const StatusBadge = ({ status }: { status: Task['status'] }) => {
   const config: Record<Task['status'], { label: string; icon: typeof Clock; className: string }> = {
@@ -133,6 +141,7 @@ export function TasksView({
   onSelectCallTask,
   onWatchTranscript,
   onCallEnded,
+  onRetryCall,
 }: TasksViewProps) {
   const [localTasks] = useState<Task[]>(sampleTasks);
   const genericTasks = dashboardTasks != null ? dashboardTasks.map(toListTask) : localTasks;
@@ -154,6 +163,7 @@ export function TasksView({
         onBack={() => onSelectCallTask(null)}
         onWatchTranscript={onWatchTranscript}
         onCallEnded={onCallEnded}
+        onRetryCall={onRetryCall}
       />
     );
   }
@@ -256,7 +266,7 @@ export function TasksView({
               >
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
-                    <h3 className="font-medium text-gray-900">{task.title}</h3>
+                    <h3 className="font-medium text-gray-900">{formatTaskTitle(task.title)}</h3>
                     <p className="text-sm text-gray-500 mt-1">{task.description}</p>
                     <div className="flex items-center gap-2 mt-3 text-xs text-gray-400">
                       <span>{task.vendor}</span>

@@ -1,5 +1,0 @@
-<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg" aria-label="Holdless logo">
-  <rect x="8" y="8" width="112" height="112" rx="20" fill="#2563EB"/>
-  <path d="M38 54c0 18 18 36 36 36 5 0 10-2 12-6 2-3 1-6-2-8l-8-5c-2-1-4-1-6 1l-2 2c-6-3-10-7-13-13l2-2c2-2 2-4 1-6l-5-8c-2-3-5-4-8-2-4 2-6 7-6 11z" fill="#fff"/>
-  <path d="M88 84l-10 10-6-6" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>

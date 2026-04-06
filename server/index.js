@@ -32,6 +32,13 @@ const CALL_BACKEND_ALLOW_NO_AUTH =
   (process.env.CALL_BACKEND_ALLOW_NO_AUTH || "").toLowerCase() === "true";
 const USE_CALL_BACKEND = !!CALL_BACKEND_URL;
 
+/** Ngrok free tier returns an HTML interstitial for requests without this header (breaks JSON APIs). */
+function callBackendExtraFetchHeaders() {
+  const u = CALL_BACKEND_URL || "";
+  if (!/ngrok/i.test(u)) return {};
+  return { "ngrok-skip-browser-warning": "true" };
+}
+
 // Python backend (Supabase + Redis): pet profiles, conversations, state-machine chat.
 // When frontend uses Node (VITE_API_TARGET=3001), proxy these to Python so pet profiles and history work.
 const PYTHON_BACKEND_URL = (
@@ -59,7 +66,17 @@ function proxyToPython(req, res) {
     })
     .then((text) => res.send(text))
     .catch((err) => {
-      console.error("[Python proxy]", req.method, req.originalUrl, err.message);
+      console.error(
+        "[Python proxy]",
+        req.method,
+        req.originalUrl,
+        "->",
+        url,
+        err.message,
+      );
+      console.error(
+        "[Python proxy] Is the Python backend running? Start it with: python run_chat_api.py (default: http://localhost:8000)",
+      );
       res
         .status(502)
         .json({ error: "Python backend unavailable", detail: err.message });
@@ -67,11 +84,15 @@ function proxyToPython(req, res) {
 }
 
 function getCallBackendToken(req) {
+  const envToken = (CALL_API_TOKEN || "").trim();
   const auth = req.headers?.authorization;
   const bearer = auth && auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   const fromBody =
     req.body?.callBackendToken && String(req.body.callBackendToken).trim();
-  return bearer || fromBody || CALL_API_TOKEN || "";
+  // Call backend JWT is usually NOT the same as Supabase (or other app) Bearer. If CALL_API_TOKEN
+  // is set, use it so POST /api/calls does not receive an "Invalid token" from the wrong issuer.
+  if (envToken) return envToken;
+  return bearer || fromBody || "";
 }
 
 app.get("/", (req, res) => {
@@ -97,8 +118,8 @@ app.get("/", (req, res) => {
 app.all("/api/pet-profiles", proxyToPython);
 app.all("/api/pet-profiles/:id", proxyToPython);
 app.get("/api/conversations", proxyToPython);
-  app.delete("/api/conversations/:id", proxyToPython);
-  app.get("/api/conversations/:id/messages", proxyToPython);
+app.delete("/api/conversations/:id", proxyToPython);
+app.get("/api/conversations/:id/messages", proxyToPython);
 app.all("/api/tasks", proxyToPython);
 app.all("/api/tasks/:taskId", proxyToPython);
 
@@ -112,7 +133,10 @@ if (USE_CALL_BACKEND) {
     try {
       const proxy = await fetch(`${CALL_BACKEND_URL}/api/auth/signin`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...callBackendExtraFetchHeaders(),
+        },
         body: JSON.stringify({
           email: String(email).trim(),
           password: String(password),
@@ -141,7 +165,10 @@ if (USE_CALL_BACKEND) {
     try {
       const proxy = await fetch(`${CALL_BACKEND_URL}/api/auth/refresh`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...callBackendExtraFetchHeaders(),
+        },
         body: JSON.stringify({
           refreshToken: tokenStr,
           refresh_token: tokenStr,
@@ -180,6 +207,20 @@ const GOOGLE_PLACES_API_KEY =
 // const VAPI_SERVER_URL = process.env.VAPI_SERVER_URL || '';
 
 /**
+ * Remove US-style phone numbers from purpose/description text so the purpose
+ * is clean (e.g. "Get a neuter quote for my cat" without "from 9452644540").
+ */
+function stripPhoneNumbersFromPurpose(text) {
+  if (!text || typeof text !== "string") return text;
+  // Match US numbers: optional +1/1, then 10 digits with optional separators
+  const cleaned = text.replace(
+    /(?:\+1|1)?[-.\s()]*(?:\d{3})[-.\s)]*(?:\d{3})[-.\s]*(?:\d{4})\b/g,
+    "",
+  );
+  return cleaned.replace(/[\s.\-,]+/g, " ").trim() || text;
+}
+
+/**
  * Translate text to English for the call purpose (Realtime backend receives English).
  * Uses OpenAI; on failure returns the original text.
  */
@@ -216,9 +257,9 @@ const PURPOSE_SUMMARY_MAX_LENGTH = 500;
  */
 async function summarizeChatToPurpose(messages, callReason) {
   if (!openai || !Array.isArray(messages) || messages.length === 0) {
-    const fallback = (callReason || "")
-      .trim()
-      .slice(0, PURPOSE_SUMMARY_MAX_LENGTH);
+    const fallback = stripPhoneNumbersFromPurpose(
+      (callReason || "").trim().slice(0, PURPOSE_SUMMARY_MAX_LENGTH),
+    );
     return fallback || "Customer inquiry";
   }
   const trimmedReason = (callReason || "").trim();
@@ -251,16 +292,18 @@ Call reason from the assistant: ${trimmedReason || "(none)"}`,
       max_tokens: 256,
     });
     const out = (completion.choices?.[0]?.message?.content ?? "").trim();
-    const result = out
+    const raw = out
       ? out.slice(0, PURPOSE_SUMMARY_MAX_LENGTH)
       : trimmedReason.slice(0, PURPOSE_SUMMARY_MAX_LENGTH);
-    return result || "Customer inquiry";
+    const result = stripPhoneNumbersFromPurpose(raw) || raw;
+    return result.slice(0, PURPOSE_SUMMARY_MAX_LENGTH) || "Customer inquiry";
   } catch (err) {
     console.warn("[Summarize purpose] failed, using call_reason:", err.message);
-    return (trimmedReason || "Customer inquiry").slice(
+    const fallback = (trimmedReason || "Customer inquiry").slice(
       0,
       PURPOSE_SUMMARY_MAX_LENGTH,
     );
+    return stripPhoneNumbersFromPurpose(fallback) || fallback;
   }
 }
 
@@ -377,11 +420,12 @@ async function classifyIntent(userMessage) {
 const SYSTEM_PROMPT = `You are a helpful AI customer service assistant for Holdless. You CAN make outbound phone calls for users—this is a core feature.
 
 CALL RULES (highest priority):
-- Before placing ANY call, you MUST first confirm with the user. Reply with a short summary: who you will call (phone number) and what you will ask (reason). Then ask: "Should I proceed with the call? (Yes/No)". Do NOT use place_call until the user replies Yes (or similar confirmation).
-- Only after the user confirms (e.g. "Yes", "Go ahead", "Please do") may you use place_call with that number and reason.
+- Before placing ANY call, you MUST (1) ask what name to use for the call, then (2) confirm with the user. Reply with a short summary: who you will call (phone number), what name you will use, and what you will ask (reason). Then ask: "Should I proceed with the call? (Yes/No)". Do NOT use place_call until the user has provided a name AND replied Yes (or similar confirmation).
+- NAME FOR CALLS: You MUST ask "What name should I use for the call?" before placing the call. If the user has a profile name (provided in context below), suggest it: "Your profile name is [name], or type a different name." Use the name they confirm or type in the place_call \`name\` parameter. Only after the user provides a name may you use place_call.
+- Only after the user confirms (e.g. "Yes", "Go ahead", "Please do") may you use place_call with that number, name, and reason.
 - Do NOT use search_places for call requests. Phone numbers are for calling, not searching.
 - When they say "that number" or "them", get the number from the CONVERSATION HISTORY.
-- Extract: phone number (add +1 for US 10-digit) and call reason. First ask for confirmation; after they say Yes, then call.
+- Extract: phone number (add +1 for US 10-digit), name for the call, and call reason. First ask for name, then ask for confirmation; after they provide both, then call.
 
 SEARCH RULES (only when user wants to find places, not call):
 - When the user asks to search for places (e.g. "search nearby hospital in 90024", "find coffee shops in 90210"), use search_places.
@@ -433,7 +477,7 @@ const TOOLS = [
     function: {
       name: "place_call",
       description:
-        'Place an outbound phone call. Use ONLY after the user has confirmed (e.g. replied Yes to "Should I proceed with the call?"). First message: reply with a summary (number, reason) and ask Yes/No. Second message after Yes: use place_call with the number and reason from the conversation.',
+        'Place an outbound phone call. Use ONLY after you have asked for the call name AND the user has confirmed (e.g. replied Yes to "Should I proceed with the call?"). First: ask "What name should I use for the call?" (suggest profile name if available). Then: reply with a summary (number, name, reason) and ask Yes/No. After they say Yes: use place_call with the number, name, and reason from the conversation.',
       parameters: {
         type: "object",
         properties: {
@@ -447,6 +491,11 @@ const TOOLS = [
             description:
               'The reason or purpose for the call, e.g. "ask for the price of cat neuter service", "return damaged strawberries", "request refund for order". The backend will receive a summarized version (under 500 chars) of the full chat as the purpose.',
           },
+          name: {
+            type: "string",
+            description:
+              'The name to use for the call (caller name). Required. Use the name the user provided when you asked "What name should I use for the call?" (or their profile name if they confirmed it).',
+          },
           voice_preference: {
             type: "string",
             description:
@@ -457,7 +506,7 @@ const TOOLS = [
             description: "Optional. Extra instructions for the call.",
           },
         },
-        required: ["phone_number", "call_reason"],
+        required: ["phone_number", "call_reason", "name"],
       },
     },
   },
@@ -613,6 +662,22 @@ async function placeCall(
         "Call backend requires authentication. Set CALL_API_TOKEN in .env (e.g. your backend API key), or CALL_BACKEND_ALLOW_NO_AUTH=true if your backend needs no auth.",
     };
   }
+  const debugBearer = (process.env.CALL_DEBUG_HARDCODE_BEARER || "").trim();
+  console.log(
+    "[Call] bearer source:",
+    debugBearer
+      ? "CALL_DEBUG_HARDCODE_BEARER"
+      : String(callBackendToken || "").trim()
+        ? "client request"
+        : (CALL_API_TOKEN || "").trim()
+          ? "CALL_API_TOKEN"
+          : CALL_BACKEND_ALLOW_NO_AUTH
+            ? "none (CALL_BACKEND_ALLOW_NO_AUTH)"
+            : "none",
+  );
+  if (token && !String(callBackendToken || "").trim() && !debugBearer) {
+    console.log("[Call] Bearer from CALL_API_TOKEN (.env), not request body/header");
+  }
   return placeCallViaBackend(normalized, callReason, token, options);
 }
 
@@ -629,7 +694,9 @@ async function placeCallViaBackend(
   options = {},
 ) {
   const url = `${CALL_BACKEND_URL}/api/calls`;
-  const rawPurpose = (callReason || "").trim() || "Customer inquiry";
+  const rawPurpose = stripPhoneNumbersFromPurpose(
+    (callReason || "").trim() || "Customer inquiry",
+  );
   const purpose = (await translateToEnglish(rawPurpose)).slice(
     0,
     PURPOSE_SUMMARY_MAX_LENGTH,
@@ -645,9 +712,14 @@ async function placeCallViaBackend(
       intent.confidence,
     );
   }
+  const callName =
+    options.name != null && String(options.name).trim()
+      ? String(options.name).trim()
+      : "Holdless";
   const body = {
     phone_number: phoneNumber,
     purpose,
+    name: callName,
     ...(intent && { intent }),
     ...(options.voice_preference != null &&
       String(options.voice_preference).trim() && {
@@ -662,8 +734,20 @@ async function placeCallViaBackend(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  const headers = { "Content-Type": "application/json" };
-  if ((token || "").trim()) headers.Authorization = `Bearer ${token.trim()}`;
+  const headers = {
+    "Content-Type": "application/json",
+    ...callBackendExtraFetchHeaders(),
+  };
+  // Temporary debug: set CALL_DEBUG_HARDCODE_BEARER in .env to a known-good token to test
+  // whether failures are due to token passing (same idea as hardcoding Bearer in code — remove after).
+  const debugBearer = (process.env.CALL_DEBUG_HARDCODE_BEARER || "").trim();
+  const bearerForAuth = debugBearer || (token || "").trim();
+  if (debugBearer) {
+    console.warn(
+      "[Call] CALL_DEBUG_HARDCODE_BEARER is set — using it instead of request/env token; remove after debugging",
+    );
+  }
+  if (bearerForAuth) headers.Authorization = `Bearer ${bearerForAuth}`;
 
   try {
     const res = await fetch(url, {
@@ -730,12 +814,37 @@ async function placeCallViaBackend(
     };
   } catch (err) {
     clearTimeout(timeoutId);
-    console.error("[Call] backend placeCall exception:", err.name, err.message);
+    const cause = err.cause && typeof err.cause === "object" ? err.cause : null;
+    const code = cause?.code ?? err.code;
+    console.error(
+      "[Call] backend placeCall exception:",
+      err.name,
+      err.message,
+      code ? `| cause.code: ${code}` : "",
+      cause?.message ? `| cause: ${cause.message}` : "",
+      "| url:",
+      url,
+    );
     const isTimeout = err.name === "AbortError";
+    const sslPacketTooLong =
+      code === "ERR_SSL_PACKET_LENGTH_TOO_LONG" ||
+      (typeof cause?.message === "string" &&
+        cause.message.includes("packet length too long"));
+    const hint =
+      sslPacketTooLong
+        ? " This usually means CALL_BACKEND_URL uses https:// but the server on that host:443 is speaking plain HTTP (wrong scheme), or the tunnel is not an HTTP/S tunnel (use `ngrok http <port>`, not `ngrok tcp`). Try http:// in CALL_BACKEND_URL or fix TLS on the call backend."
+        : code === "ECONNREFUSED" || code === "ENOTFOUND"
+          ? " Check CALL_BACKEND_URL, VPN/firewall, and that the tunnel (e.g. ngrok) is running."
+          : "";
+    if (sslPacketTooLong) {
+      console.error(
+        "[Call] Hint: openssl 'packet length too long' = TLS handshake received non-TLS bytes (HTTP on :443, wrong proxy, or tcp tunnel vs http tunnel).",
+      );
+    }
     return {
       error: isTimeout
         ? "Call backend request timed out. Please try again in a moment."
-        : err.message || "Failed to place call",
+        : `${err.message || "Failed to place call"}${hint}`,
     };
   }
 }
@@ -792,7 +901,7 @@ async function getCallStatusFromBackend(callId, token) {
   const maxRetries = 3;
   const retryDelaysMs = [0, 500, 1500];
 
-  const headers = {};
+  const headers = { ...callBackendExtraFetchHeaders() };
   if ((token || "").trim()) headers.Authorization = `Bearer ${token.trim()}`;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -843,6 +952,7 @@ async function getCallStatusFromBackend(callId, token) {
         startedAt: call.started_at ?? call.startedAt ?? call.created_at,
         endedAt: call.ended_at ?? call.endedAt ?? call.completed_at,
         cost: call.cost,
+        phone_number: call.phone_number ?? data.phone_number,
       };
     } catch (err) {
       clearTimeout(timeoutId);
@@ -878,6 +988,45 @@ async function getCallStatusFromBackend(callId, token) {
   }
 
   return { error: "Failed to fetch call status after retries." };
+}
+
+/**
+ * Fetch transcript records from call backend GET /api/calls/:callId/transcripts.
+ * Returns transcript text (e.g. "Customer: ...\nAgent: ...") or empty string on error.
+ * Used when getCallStatus does not include transcript (e.g. backend stores it only in transcripts endpoint).
+ */
+async function getTranscriptsFromBackend(callId, token) {
+  if (!USE_CALL_BACKEND || !CALL_BACKEND_URL) return "";
+  const url = `${CALL_BACKEND_URL}/api/calls/${callId}/transcripts`;
+  const headers = {
+    Accept: "application/json",
+    ...callBackendExtraFetchHeaders(),
+  };
+  if ((token || "").trim()) headers.Authorization = `Bearer ${token.trim()}`;
+  try {
+    const res = await fetch(url, { headers });
+    const text = await res.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_) {}
+    if (!res.ok) return "";
+    const list = data.transcripts;
+    if (!Array.isArray(list) || list.length === 0) return "";
+    return list
+      .map((t) => {
+        const role =
+          t.speaker === "human" || t.speaker === "customer"
+            ? "Customer"
+            : "Agent";
+        const content = t.message ?? t.content ?? t.text ?? "";
+        return `${role}: ${content}`;
+      })
+      .join("\n");
+  } catch (err) {
+    console.error("[Call] getTranscriptsFromBackend error:", err.message);
+    return "";
+  }
 }
 
 /**
@@ -956,7 +1105,9 @@ app.post("/api/chat", async (req, res) => {
         }
         if (
           p.ok &&
-          data.debug_state === "CONFIRMED" &&
+          !data.callId &&
+          (data.debug_state === "CONFIRMED" ||
+            data.debug_state === "RETURN_CONFIRMED") &&
           data.hospital_phone &&
           data.task_id &&
           USE_CALL_BACKEND
@@ -1039,6 +1190,8 @@ app.post("/api/chat", async (req, res) => {
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages array is required" });
   }
+  const profileName =
+    req.body?.profileName != null ? String(req.body.profileName).trim() : "";
   const callBackendToken = getCallBackendToken(req);
   const fromHeader = req.headers?.authorization?.startsWith("Bearer ");
   const fromBody = !!(
@@ -1055,8 +1208,12 @@ app.post("/api/chat", async (req, res) => {
     !!CALL_API_TOKEN,
   );
 
+  const systemContent = profileName
+    ? `${SYSTEM_PROMPT}\n\nUSER PROFILE NAME: The user's profile name is "${profileName}". When asking for the call name, suggest it: "What name should I use for the call? (Your profile name is ${profileName}, or type a different name.)"`
+    : SYSTEM_PROMPT;
+
   const openaiMessages = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemContent },
     ...messages.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
       content: String(m.content || ""),
@@ -1190,48 +1347,56 @@ app.post("/api/chat", async (req, res) => {
             "[Call] place_call skipped (already invoked once this request)",
           );
         } else {
+          const callName =
+            args.name != null && String(args.name).trim()
+              ? String(args.name).trim()
+              : "Holdless";
           placeCallAlreadyInvoked = true;
-          const purpose = await summarizeChatToPurpose(
-            openaiMessages,
-            args.call_reason,
-          );
-          const callOptions = {};
-          if (
-            args.voice_preference != null &&
-            String(args.voice_preference).trim()
-          )
-            callOptions.voice_preference = String(args.voice_preference).trim();
-          if (
-            args.additional_instructions != null &&
-            String(args.additional_instructions).trim()
-          )
-            callOptions.additional_instructions = String(
-              args.additional_instructions,
-            ).trim();
-          console.log(
-            "[Call] place_call invoked | phone:",
-            args.phone_number,
-            "| purpose length:",
-            purpose.length,
-          );
-          const callResult = await placeCall(
-            args.phone_number,
-            purpose,
-            callBackendToken,
-            callOptions,
-          );
-          console.log(
-            "[Call] place_call result:",
-            callResult.callId
-              ? { callId: callResult.callId, status: callResult.status }
-              : { error: callResult.error },
-          );
-          if (callResult.callId) {
-            lastCallId = callResult.callId;
-            lastCallReason = callResult.callReason || purpose;
-            lastCallDomain = callResult.domain ?? null;
-          }
-          toolResult = JSON.stringify(callResult);
+            const purpose = await summarizeChatToPurpose(
+              openaiMessages,
+              args.call_reason,
+            );
+            const callOptions = { name: callName };
+            if (
+              args.voice_preference != null &&
+              String(args.voice_preference).trim()
+            )
+              callOptions.voice_preference = String(
+                args.voice_preference,
+              ).trim();
+            if (
+              args.additional_instructions != null &&
+              String(args.additional_instructions).trim()
+            )
+              callOptions.additional_instructions = String(
+                args.additional_instructions,
+              ).trim();
+            console.log(
+              "[Call] place_call invoked | phone:",
+              args.phone_number,
+              "| name:",
+              callName,
+              "| purpose length:",
+              purpose.length,
+            );
+            const callResult = await placeCall(
+              args.phone_number,
+              purpose,
+              callBackendToken,
+              callOptions,
+            );
+            console.log(
+              "[Call] place_call result:",
+              callResult.callId
+                ? { callId: callResult.callId, status: callResult.status }
+                : { error: callResult.error },
+            );
+            if (callResult.callId) {
+              lastCallId = callResult.callId;
+              lastCallReason = callResult.callReason || purpose;
+              lastCallDomain = callResult.domain ?? null;
+            }
+            toolResult = JSON.stringify(callResult);
         }
       } else {
         toolResult = JSON.stringify({ error: "Unknown or invalid tool call" });
@@ -1332,13 +1497,9 @@ app.post("/api/call/:callId/summarize", async (req, res) => {
       ? req.headers.authorization.slice(7).trim()
       : CALL_API_TOKEN;
   const purpose =
-    typeof req.body?.purpose === "string"
-      ? req.body.purpose.trim()
-      : "";
+    typeof req.body?.purpose === "string" ? req.body.purpose.trim() : "";
   const bodyTranscript =
-    typeof req.body?.transcript === "string"
-      ? req.body.transcript.trim()
-      : "";
+    typeof req.body?.transcript === "string" ? req.body.transcript.trim() : "";
 
   let transcriptText = bodyTranscript;
 
@@ -1356,16 +1517,26 @@ app.post("/api/call/:callId/summarize", async (req, res) => {
       const transcript = statusResult.transcript || [];
       transcriptText =
         transcript
-          .map((m) => `${m.role === "customer" ? "Customer" : "Agent"}: ${m.content}`)
+          .map(
+            (m) =>
+              `${m.role === "customer" ? "Customer" : "Agent"}: ${m.content}`,
+          )
           .join("\n") || "";
       if (transcriptText) break;
     }
+  }
+
+  // When call status endpoint has no transcript, try transcripts API (e.g. backend stores transcript there)
+  if (!transcriptText || !transcriptText.trim()) {
+    const token = (callBackendToken || "").trim() || CALL_API_TOKEN;
+    transcriptText = await getTranscriptsFromBackend(callId, token);
   }
 
   if (!transcriptText || !transcriptText.trim()) {
     return res.status(200).json({
       summary:
         "No transcript available for this call. Summary will appear after the call is processed.",
+      usefulInfoObtained: false,
     });
   }
 
@@ -1379,12 +1550,14 @@ app.post("/api/call/:callId/summarize", async (req, res) => {
     const systemPrompt =
       "You are a concise call analyst. Summarize and analyze the call transcript with respect to the caller's purpose. " +
       "Focus on: key facts (e.g. prices, dates, policies), comparisons if multiple options were discussed (e.g. 'Clinic A is $200, the cheapest; Clinic B is relatively expensive'), and the outcome or next steps. " +
-      "Write 1–3 short sentences in plain English. Be specific with numbers and names when mentioned.";
+      "Write 1–3 short sentences in plain English. Be specific with numbers and names when mentioned.\n\n" +
+      "After your summary, on a new line write exactly one of:\nUSEFUL_INFO_OBTAINED: yes\nor\nUSEFUL_INFO_OBTAINED: no\n" +
+      "Use 'yes' only if the caller actually obtained the information they sought (e.g. a price, a resolution, a confirmation). Use 'no' if the other party did not provide the requested information (e.g. no price given, vague or incomplete answers, call ended without the goal being met).";
     const userContent =
       (purpose
         ? `Call purpose: ${purpose}\n\nTranscript:\n${transcriptText}`
         : `Transcript:\n${transcriptText}`) +
-      "\n\nProvide a brief summary and analysis with respect to the purpose above.";
+      "\n\nProvide a brief summary and analysis with respect to the purpose above. Then on a new line write USEFUL_INFO_OBTAINED: yes or USEFUL_INFO_OBTAINED: no.";
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -1395,16 +1568,93 @@ app.post("/api/call/:callId/summarize", async (req, res) => {
       max_tokens: 400,
       temperature: 0.3,
     });
-    const summary =
+    const raw =
       completion?.choices?.[0]?.message?.content?.trim() ||
       "Unable to generate summary.";
-    return res.json({ summary });
+    const usefulMatch = raw.match(
+      /\n?\s*USEFUL_INFO_OBTAINED:\s*(yes|no)\s*$/i,
+    );
+    const usefulInfoObtained = usefulMatch
+      ? usefulMatch[1].toLowerCase() === "yes"
+      : true;
+    const summary = usefulMatch
+      ? raw.slice(0, usefulMatch.index).trim() || raw
+      : raw;
+    return res.json({ summary, usefulInfoObtained });
   } catch (err) {
     console.error("[Call] summarize error:", err.message);
     return res.status(500).json({
       error: err.message || "Summarization failed.",
     });
   }
+});
+
+/**
+ * POST /api/call/retry — Place a new call with the same phone and purpose as a previous call.
+ * Body: { callId: string, purpose: string }. Auth: Bearer <token>.
+ * Fetches phone_number from call backend for the given callId, then places a new call.
+ * Returns { callId: string } for the new call, or { error }.
+ * Intended for "retry once" when the first call did not obtain useful information.
+ */
+app.post("/api/call/retry", async (req, res) => {
+  if (!USE_CALL_BACKEND) {
+    return res.status(503).json({
+      error: "Call backend not configured. Set CALL_BACKEND_URL.",
+    });
+  }
+  const callBackendToken =
+    req.headers?.authorization &&
+    req.headers.authorization.startsWith("Bearer ")
+      ? req.headers.authorization.slice(7).trim()
+      : CALL_API_TOKEN;
+  const token = (callBackendToken || "").trim() || CALL_API_TOKEN;
+  if (!token && !CALL_BACKEND_ALLOW_NO_AUTH) {
+    return res.status(401).json({
+      error: "Authorization required. Send Bearer token or set CALL_API_TOKEN.",
+    });
+  }
+  const callId =
+    typeof req.body?.callId === "string" ? req.body.callId.trim() : "";
+  const purpose =
+    typeof req.body?.purpose === "string" ? req.body.purpose.trim() : "";
+  const bodyPhone =
+    typeof req.body?.phone_number === "string"
+      ? req.body.phone_number.trim()
+      : "";
+  if (!callId || !purpose) {
+    return res.status(400).json({
+      error: "callId and purpose are required.",
+    });
+  }
+  let phoneNumber = bodyPhone;
+  if (!phoneNumber) {
+    const statusResult = await getCallStatus(callId, callBackendToken);
+    if (statusResult.error) {
+      return res.status(502).json({ error: statusResult.error });
+    }
+    phoneNumber = statusResult.phone_number;
+  }
+  if (!phoneNumber || typeof phoneNumber !== "string") {
+    return res.status(400).json({
+      error:
+        "Phone number not available for this call. Send phone_number in the request body if you have it (e.g. from task payload), or ensure the call backend returns phone_number for GET /api/calls/:callId.",
+    });
+  }
+  const callResult = await placeCall(
+    phoneNumber,
+    purpose,
+    callBackendToken,
+    {},
+  );
+  if (callResult.error) {
+    return res.status(502).json({ error: callResult.error });
+  }
+  if (!callResult.callId) {
+    return res
+      .status(502)
+      .json({ error: "Place call did not return a call ID." });
+  }
+  return res.json({ callId: callResult.callId });
 });
 
 // GET /api/calls/:callId/transcripts - Fetch full transcript records for a call (call backend). Auth: Bearer <token>.
@@ -1429,7 +1679,10 @@ app.get("/api/calls/:callId/transcripts", async (req, res) => {
     });
   }
   const url = `${CALL_BACKEND_URL}/api/calls/${callId}/transcripts`;
-  const headers = { Accept: "application/json" };
+  const headers = {
+    Accept: "application/json",
+    ...callBackendExtraFetchHeaders(),
+  };
   if (token) headers.Authorization = `Bearer ${token}`;
   try {
     const backendRes = await fetch(url, { headers });

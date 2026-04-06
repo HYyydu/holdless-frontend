@@ -9,10 +9,17 @@ from app.services.fake_clinics import get_fake_clinics
 
 MAX_CLINIC_SELECTIONS = 4
 ZIP_PATTERN = re.compile(r"^\d{5}(-\d{4})?$")
+# US NANP: optional +1/1, then 10 digits with optional separators (used for extraction and stripping)
+_PHONE_PATTERN = re.compile(
+    r"(?:\+1|1)?[-.\s()]*(?:\d{3})[-.\s)]*(?:\d{3})[-.\s]*(?:\d{4})\b"
+)
 
 
 class ConversationState(str, Enum):
     AWAITING_ZIP = "AWAITING_ZIP"
+    SLOT_COLLECTING = "SLOT_COLLECTING"  # slot engine driving collection
+    SLOT_AWAITING_PET_PROFILE = "SLOT_AWAITING_PET_PROFILE"  # ask "use existing profile?" (slot flow)
+    SLOT_AWAITING_PET_SELECTION = "SLOT_AWAITING_PET_SELECTION"  # user picks profile 1,2,3 (slot flow)
     AWAITING_PET_CONFIRM = "AWAITING_PET_CONFIRM"
     AWAITING_PET_SELECTION = "AWAITING_PET_SELECTION"
     AWAITING_PET_NAME = "AWAITING_PET_NAME"
@@ -26,6 +33,7 @@ class ConversationState(str, Enum):
 
 
 def _normalize_zip(msg: str) -> str | None:
+    """Return 5-digit ZIP only when the message is essentially just digits (5 or 9)."""
     digits = re.sub(r"\D", "", msg.strip())
     if len(digits) == 5:
         return digits
@@ -34,9 +42,50 @@ def _normalize_zip(msg: str) -> str | None:
     return None
 
 
+def _extract_zip_from_text(msg: str) -> str | None:
+    """Extract a 5-digit (or 9-digit) ZIP from anywhere in the text (e.g. address ending in '90024')."""
+    if not msg or not isinstance(msg, str):
+        return None
+    # Match 5-digit or 5+4 ZIP (US)
+    match = re.search(r"\b(\d{5})(?:-\d{4})?\b", msg.strip())
+    if match:
+        return match.group(1)
+    return None
+
+
+def _looks_like_address(msg: str) -> bool:
+    """True if message looks like a street address (letters + numbers, multiple words), not a phone or pure ZIP."""
+    if not msg or len(msg.strip()) < 5:
+        return False
+    s = msg.strip()
+    # Exclude: pure digits (ZIP), or phone-like (10–11 digits, maybe with separators)
+    digits_only = re.sub(r"\D", "", s)
+    if len(digits_only) <= 5 and len(s) <= 12:
+        return False
+    if len(digits_only) >= 10 and len(digits_only) <= 11:
+        return False
+    # Has letters and at least one digit or multiple words (e.g. "740 weyburn terrace")
+    has_letter = bool(re.search(r"[A-Za-z]", s))
+    word_count = len(s.split())
+    return has_letter and (word_count >= 2 or re.search(r"\d", s) is not None)
+
+
 def _normalize_phone(msg: str) -> str | None:
     """Accept 10–11 digit US phone; return digits only or with +1 prefix for storage."""
-    digits = re.sub(r"\D", "", msg.strip())
+    if not msg or not isinstance(msg, str):
+        return None
+    s = msg.strip()
+    if not s:
+        return None
+    # Substring match: if the user adds other digits in the same message (years, IDs like EK2026),
+    # concatenating all digits breaks 10/11-length detection; prefer a NANP-shaped span first.
+    for m in _PHONE_PATTERN.finditer(s):
+        cand = re.sub(r"\D", "", m.group(0))
+        if len(cand) == 10:
+            return f"+1{cand}"
+        if len(cand) == 11 and cand.startswith("1"):
+            return f"+{cand}"
+    digits = re.sub(r"\D", "", s)
     if len(digits) == 10:
         return f"+1{digits}"
     if len(digits) == 11 and digits.startswith("1"):
@@ -45,30 +94,109 @@ def _normalize_phone(msg: str) -> str | None:
 
 
 def _extract_call_reason(msg: str) -> str | None:
-    """Extract call purpose from message like 'Call X to ask for cat neuter price'."""
+    """Extract call purpose from a message.
+
+    Supports both:
+    - information gathering: "call X to ask/check/find out ..."
+    - message delivery: "call X and tell them/let them know/inform/share ..."
+    """
     m = (msg or "").strip()
     if not m:
         return None
-    # Patterns: "ask for X", "to ask for X", "to get X", "for X", "about X"
-    for pat in [
+    # Strip leading "dial X and" / "call X and" so we match the intent clause (e.g. "check the neutering cost for a cat")
+    m = re.sub(
+        r"^(?:dial|call)\s+(?:\d[\d\s\-\.\(\)]+)\s+and\s+",
+        "",
+        m,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Chinese: purpose after 来问 / 询问 / 咨询 / 了解 (before sentence end)
+    for pat in (
+        r"来问(.+?)(?:\s*$|[。．，,])",
+        r"询问(.+?)(?:\s*$|[。．，,])",
+        r"咨询(.+?)(?:\s*$|[。．，,])",
+        r"了解(.+?)(?:\s*$|[。．，,])",
+    ):
+        match = re.search(pat, m)
+        if match:
+            extracted = match.group(1).strip()
+            extracted = _strip_phone_numbers(extracted)
+            if extracted:
+                return extracted[:120]
+    # Patterns (order matters): prefer full task phrases so we keep "the neutering cost for a cat", not just "a cat"
+    delivery_patterns: list[tuple[str, str]] = [
+        # Message delivery (prefer explicit wording so we don't misclassify generic "for/about" clauses)
+        # "to tell we are going out tonight" / "deliver a message to X to tell we are ..." (pronoun optional)
+        (r"(?:to\s+)?tell\s+(?:him|her|them)?\s*(?:that\s+)?(.+)", "Tell them: "),
+        (r"(?:to\s+)?let\s+(?:him|her|them)\s+know\s+(?:that\s+)?(.+)", "Tell them: "),
+        (r"(?:to\s+)?inform\s+(?:him|her|them)\s+(?:that\s+)?(.+)", "Tell them: "),
+        (r"(?:to\s+)?share\s+(?:the\s+)?information\s+(?:that\s+)?(.+)", "Tell them: "),
+    ]
+    info_patterns: list[str] = [
+        r"(?:to\s+)?ask\s+(.+)",  # "ask the price for a cat neuter service" -> "the price for a cat neuter service"
         r"(?:to\s+)?ask\s+for\s+(.+)",
         r"to\s+get\s+(.+)",
         r"(?:inquire|get)\s+(?:about\s+)?(.+)",
+        r"check\s+(.+)",  # "check the neutering cost for a cat" -> full phrase (before generic "for")
+        r"find\s+out\s+(.+)",
+        r"to\s+((?:return|cancel|reschedule|book|schedule|order|request|report|discuss|dispute|buy|change|update|complain|inquire)\b.+)",
+        r"(?:can\s+you\s+)?(?:please\s+)?return\s+(.+)",  # e.g. "Can you return the damaged strawberries to 9452644540?"
         r"for\s+(.+)",
         r"about\s+(.+)",
-    ]:
+    ]
+    for pat, prefix in delivery_patterns:
         match = re.search(pat, m, re.IGNORECASE)
         if match:
-            return match.group(1).strip()[:120]
+            extracted = (prefix + match.group(1).strip()).strip()
+            extracted = _strip_phone_numbers(extracted)
+            # Phone stripping can leave trailing artifacts like "to call"; trim repeatedly.
+            while True:
+                trimmed = re.sub(
+                    r"\b(?:to|call|dial|phone)\b\s*$",
+                    "",
+                    extracted,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if trimmed == extracted:
+                    break
+                extracted = trimmed
+            return extracted[:120] if extracted else None
+    for pat in info_patterns:
+        match = re.search(pat, m, re.IGNORECASE)
+        if match:
+            extracted = match.group(1).strip()
+            extracted = _strip_phone_numbers(extracted)
+            while True:
+                trimmed = re.sub(
+                    r"\b(?:to|call|dial|phone)\b\s*$",
+                    "",
+                    extracted,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if trimmed == extracted:
+                    break
+                extracted = trimmed
+            return extracted[:120] if extracted else None
     return None
 
 
 PURPOSE_MAX_LENGTH = 500
 
 
+def _strip_phone_numbers(text: str) -> str:
+    """Remove US-style phone numbers from text so purpose/description stays clean (e.g. no 'from 9452644540')."""
+    if not text or not isinstance(text, str):
+        return text
+    cleaned = _PHONE_PATTERN.sub("", text)
+    # Collapse whitespace only; do not strip periods/commas (they separate sentences in call purpose).
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def _build_call_purpose(context: dict[str, Any], profile: dict[str, Any] | None = None) -> str:
     """Build the same purpose string we send to the call backend (max 500 chars)."""
     reason = (context.get("call_reason") or "").strip() or "Veterinary price inquiry"
+    reason = _strip_phone_numbers(reason) or "Veterinary price inquiry"
     bits = []
     if context.get("pet_profile_id"):
         if profile is None:
@@ -77,7 +205,7 @@ def _build_call_purpose(context: dict[str, Any], profile: dict[str, Any] | None 
             profile = get_pet_profile(context["pet_profile_id"])
         if profile:
             name = (profile.get("name") or "").strip() or "pet"
-            bits.append(f"pet {name}")
+            bits.append(name)
             if profile.get("species"):
                 bits.append(f"species {profile['species']}")
             if profile.get("breed"):
@@ -92,25 +220,56 @@ def _build_call_purpose(context: dict[str, Any], profile: dict[str, Any] | None 
                 bits.append(f"date of birth {str(dob)}")
         else:
             name = context.get("pet_profile_name") or "pet"
-            bits.append(f"pet {name}")
+            bits.append(name)
     elif context.get("name") or context.get("breed"):
         name = context.get("name") or "pet"
         breed = context.get("breed")
         age = context.get("age")
         weight = context.get("weight")
-        bits.append(f"pet {name}")
+        bits.append(name)
         if breed:
             bits.append(f"breed {breed}")
         if age:
             bits.append(f"age {age}")
         if weight:
             bits.append(f"weight {weight}")
-    purpose = f"Get {reason} for the " + ", ".join(bits) if bits else f"Get {reason}."
+    # Prefer clear task-first wording: "Get [reason]. Pet: ..." so the purpose is not read as "Get a cat for the pet Buddy"
+    if bits:
+        purpose = f"Get {reason}. Pet: " + ", ".join(bits)
+    else:
+        purpose = f"Get {reason}."
+    # Strip any phone numbers that might have appeared in pet bits or elsewhere
+    purpose = _strip_phone_numbers(purpose)
     return purpose[:PURPOSE_MAX_LENGTH]
 
 
 def _is_yes(msg: str) -> bool:
     return msg.strip().lower() in ("yes", "y", "yeah", "yep", "confirm", "correct")
+
+
+def is_positive_confirmation(msg: str) -> bool:
+    """
+    True if the message is a clear positive confirmation (e.g. accepting a hybrid offer to call).
+    Used so we can start the slot engine deterministically when user says "yes, call" after
+    a "Would you like me to call?" offer, without re-running Layer 1.
+    """
+    if not msg or not isinstance(msg, str):
+        return False
+    m = msg.strip().lower()
+    if m in ("yes", "y", "yeah", "yep", "sure", "please", "please do", "ok", "okay", "confirm", "correct"):
+        return True
+    # Phrases that accept an offer to call
+    call_accept = (
+        "i would like you to call",
+        "yes i would like you to call",
+        "yes, i would like you to call",
+        "please call",
+        "go ahead and call",
+        "yes please call",
+        "call them",
+        "call please",
+    )
+    return any(phrase in m for phrase in call_accept)
 
 
 def _is_no(msg: str) -> bool:
@@ -235,10 +394,45 @@ def transition(
                 "Thanks! I'll use that hospital number. Do you want to use an existing profile? (yes/no)",
                 None,
             )
+        # Accept ZIP embedded in text (e.g. "740 weyburn terrace, los angeles ca 90024") or full address
+        zip_from_text = _extract_zip_from_text(msg)
+        if zip_from_text:
+            context["zip"] = zip_from_text
+            context["location_query"] = msg.strip()[:200]
+            return (
+                ConversationState.AWAITING_PET_CONFIRM,
+                context,
+                "Thanks! I have your area (ZIP " + zip_from_text + "). Do you want to use an existing profile? (yes/no)",
+                None,
+            )
+        if _looks_like_address(msg):
+            context["address"] = msg.strip()[:200]
+            context["location_query"] = msg.strip()[:200]
+            zip_from_geocode = None
+            try:
+                from app.services.geocode import geocode_to_zip
+                zip_from_geocode = geocode_to_zip(msg)
+            except Exception:
+                pass
+            if zip_from_geocode:
+                context["zip"] = zip_from_geocode
+                return (
+                    ConversationState.AWAITING_PET_CONFIRM,
+                    context,
+                    "Thanks! I have your address (area ZIP " + zip_from_geocode + "). Do you want to use an existing profile? (yes/no)",
+                    None,
+                )
+            # Address but geocode failed or no API key: still accept and ask for ZIP as fallback
+            return (
+                state,
+                context,
+                "I have your address. To search clinics by area I need a ZIP code—please add it (e.g. 90210) or send just the 5-digit ZIP.",
+                None,
+            )
         return (
             state,
             context,
-            "Please enter a 5-digit ZIP code for area search, or a hospital phone number (e.g. 10 digits).",
+            "Please enter a 5-digit ZIP code or full address for the search area (e.g. 90210 or 740 Weyburn Terrace, Los Angeles), or a hospital phone number (10 digits).",
             None,
         )
 
@@ -263,14 +457,15 @@ def transition(
                         candidates,
                     )
             # No profiles: if hospital_phone, skip availability; else ask availability
-            if context.get("hospital_phone"):
-                summary = _build_call_summary(context)
-                return (
-                    ConversationState.AWAITING_CALL_CONFIRM,
-                    context,
-                    "Please confirm before I place the call:\n\n" + summary,
-                    None,
-                )
+        if context.get("hospital_phone"):
+            summary = _build_call_summary(context)
+            purpose = _build_call_purpose(context)
+            return (
+                ConversationState.AWAITING_CALL_CONFIRM,
+                context,
+                "Please confirm before I place the call:\n\n" + summary,
+                None,
+            )
             return (
                 ConversationState.AWAITING_AVAILABILITY,
                 context,
@@ -332,6 +527,7 @@ def transition(
         # If user gave a specific phone number (price inquiry), skip availability and go to confirm
         if context.get("hospital_phone"):
             summary = _build_call_summary(context)
+            purpose = _build_call_purpose(context)
             return (
                 ConversationState.AWAITING_CALL_CONFIRM,
                 context,
@@ -378,6 +574,7 @@ def transition(
         # If user gave a specific phone number (price inquiry), skip availability and go to confirm
         if context.get("hospital_phone"):
             summary = _build_call_summary(context)
+            purpose = _build_call_purpose(context)
             return (
                 ConversationState.AWAITING_CALL_CONFIRM,
                 context,
@@ -403,6 +600,7 @@ def transition(
         # If user already gave a specific hospital phone number, skip clinic search and go to call confirmation.
         if context.get("hospital_phone"):
             summary = _build_call_summary(context)
+            purpose = _build_call_purpose(context)
             return (
                 ConversationState.AWAITING_CALL_CONFIRM,
                 context,
@@ -430,6 +628,7 @@ def transition(
             selected = [candidates[i - 1] for i in indices]
             context["selected_clinics"] = selected
             summary = _build_call_summary(context)
+            purpose = _build_call_purpose(context)
             return (
                 ConversationState.AWAITING_CALL_CONFIRM,
                 context,
@@ -451,6 +650,7 @@ def transition(
             selected = [candidates[i - 1] for i in indices]
             context["selected_clinics"] = selected
             summary = _build_call_summary(context)
+            purpose = _build_call_purpose(context)
             return (
                 ConversationState.AWAITING_CALL_CONFIRM,
                 context,
@@ -469,6 +669,13 @@ def transition(
             names = ", ".join(c.get("name", "?") for c in (context.get("selected_clinics") or []))
             if not names and context.get("hospital_phone"):
                 names = f"the hospital at {context['hospital_phone']}"
+            
+            from app.services.pet_profile_service import get_pet_profile
+            profile = None
+            if context.get("pet_profile_id"):
+                profile = get_pet_profile(context["pet_profile_id"])
+            purpose = _build_call_purpose(context, profile)
+            
             return (
                 ConversationState.CONFIRMED,
                 context,

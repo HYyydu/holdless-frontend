@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Run the Holdless Python chat API (Supabase + Redis state machine)."""
 import os
+from pathlib import Path
 
+# Load .env from project root (directory containing this script) so OPENAI_API_KEY is available
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    _root = Path(__file__).resolve().parent
+    load_dotenv(_root / ".env")
+    load_dotenv(Path.cwd() / ".env", override=False)  # cwd as fallback
 except ImportError:
     pass
 

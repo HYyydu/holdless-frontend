@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
+# Load .env so OPENAI_API_KEY is available when app is imported by uvicorn.
+# Try project root first, then cwd (e.g. if started from another directory).
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    _root = Path(__file__).resolve().parent.parent  # app/main.py -> project root
+    load_dotenv(_root / ".env")
+    load_dotenv(Path.cwd() / ".env", override=False)  # cwd as fallback, don't override
 except ImportError:
     pass
 
@@ -18,6 +23,20 @@ from app.api.slots import router as slots_router
 from app.api.tasks import router as tasks_router
 
 app = FastAPI(title="Holdless Chat API", version="1.0.0")
+
+
+@app.on_event("startup")
+def _log_openai_key_status() -> None:
+    """Log whether OPENAI_API_KEY is set so operators see it in the Python backend logs."""
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if key:
+        print("OPENAI_API_KEY: set (ChatGPT fallback and flow router enabled)")
+    else:
+        print(
+            "OPENAI_API_KEY: not set — add it to .env in the project root, or export it before starting the Python backend. "
+            "Otherwise simple chat (e.g. 'hello') will show the fallback message."
+        )
+
 
 app.add_middleware(
     CORSMiddleware,
