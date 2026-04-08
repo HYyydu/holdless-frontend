@@ -1,6 +1,8 @@
 """POST /chat: deterministic state machine chat endpoint."""
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
@@ -49,7 +51,7 @@ from app.services.state_machine import (
     is_positive_confirmation,
     transition as hospital_transition,
 )
-from app.services.state_machine import _is_yes
+from app.services.state_machine import _is_yes, _normalize_phone
 from app.services.call_placement import (
     call_backend_configured,
     place_outbound_call,
@@ -58,6 +60,11 @@ from app.services.call_placement import (
 from app.services.task_service import create_task, update_task
 
 router = APIRouter()
+
+_DIRECT_CALL_VERB_RE = re.compile(
+    r"\b(call|dial|phone|ring)\b|给.*打电话|拨打",
+    re.IGNORECASE,
+)
 
 
 class ChatRequest(BaseModel):
@@ -171,8 +178,21 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     # Deterministic hybrid: if we previously showed "Would you like me to call?" and user confirms,
     # start the slot engine directly without re-running Layer 1 (avoids Layer 1 re-classifying "yes" as chat).
     new_state, updated_context, reply_text, ui_options = None, None, None, None
+    # Deterministic direct-call entry: if user clearly provides "call + phone number", bypass Layer 1.
     if (
         at_entry_no_flow
+        and _normalize_phone(message)
+        and _DIRECT_CALL_VERB_RE.search(message or "")
+    ):
+        context["flow_type"] = FLOW_GENERAL_CALL
+        return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
+        new_state, updated_context, reply_text, ui_options = return_transition(
+            return_state, message, context
+        )
+
+    if (
+        new_state is None
+        and at_entry_no_flow
         and context.get("pending_hybrid_offer")
         and is_positive_confirmation(message)
     ):

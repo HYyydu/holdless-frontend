@@ -13,20 +13,30 @@ from app.services.openai_client import get_openai_client
 logger = logging.getLogger(__name__)
 
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
 
 
 def text_has_cjk(text: str) -> bool:
     return bool(text and _CJK_RE.search(text))
 
 
+def text_has_latin(text: str) -> bool:
+    return bool(text and _LATIN_RE.search(text))
+
+
 def update_reply_locale_from_message(context: dict[str, Any], message: str) -> dict[str, Any]:
-    """Persist preferred UI language: zh after CJK input; en after a longer Latin-only turn."""
+    """Persist preferred UI language from the latest user turn.
+
+    Rules:
+    - Any CJK in the message -> zh
+    - Any Latin letters (and no CJK) -> en
+    - Digits/symbol-only text keeps previous locale
+    """
     if not (message or "").strip():
         return context
     if text_has_cjk(message):
         return {**context, "reply_locale": "zh"}
-    letters = re.sub(r"[^A-Za-z]", "", message)
-    if len(letters) >= 20 and not text_has_cjk(message):
+    if text_has_latin(message):
         return {**context, "reply_locale": "en"}
     return context
 
