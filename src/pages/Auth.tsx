@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useDemoAuth } from '@/contexts/DemoAuthContext';
+import { useDemoAuth, SUPABASE_CONFIGURED } from '@/contexts/DemoAuthContext';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
 import { supabase } from '@/integrations/supabase/client';
 import { Button } from '@/components/ui/button';
@@ -9,13 +9,12 @@ import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
-const SUPABASE_CONFIGURED = Boolean(import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY);
-
 export default function Auth() {
   const navigate = useNavigate();
   const { signIn, createAccount } = useDemoAuth();
   const { signInToCallBackend, setTokenFromSupabaseSession } = useCallBackendAuth();
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
 
   // Sign In state
   const [signInEmail, setSignInEmail] = useState('');
@@ -32,6 +31,7 @@ export default function Auth() {
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
+    setAuthNotice(null);
     setSignInLoading(true);
     try {
       if (SUPABASE_CONFIGURED) {
@@ -46,7 +46,7 @@ export default function Auth() {
         }
         console.log('[Auth] Sign in success (Supabase):', signInEmail.trim());
         setTokenFromSupabaseSession(data.session);
-        signIn(signInEmail, signInPassword);
+        // user id comes from DemoAuthProvider via onAuthStateChange (must match auth.users.id)
       } else {
         signIn(signInEmail, signInPassword);
         const result = await signInToCallBackend(signInEmail, signInPassword);
@@ -66,6 +66,7 @@ export default function Auth() {
   const handleSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
+    setAuthNotice(null);
     setSignUpLoading(true);
     try {
       if (SUPABASE_CONFIGURED) {
@@ -81,7 +82,11 @@ export default function Auth() {
         }
         console.log('[Auth] Sign up success (Supabase):', signUpEmail.trim(), data.session ? '(session created)' : '(confirm email may be required)');
         if (data.session) setTokenFromSupabaseSession(data.session);
-        createAccount(signUpName, signUpEmail, signUpPassword);
+        // user id from session via DemoAuthProvider when data.session is set; else user confirms email first
+        if (!data.session) {
+          setAuthNotice('Check your email to confirm your account, then sign in.');
+          return;
+        }
       } else {
         createAccount(signUpName, signUpEmail, signUpPassword);
         const result = await signInToCallBackend(signUpEmail, signUpPassword);
@@ -110,6 +115,9 @@ export default function Auth() {
         <CardContent>
           {authError && (
             <p className="text-sm text-destructive mb-3 text-center">{authError}</p>
+          )}
+          {authNotice && (
+            <p className="text-sm text-muted-foreground mb-3 text-center">{authNotice}</p>
           )}
           <Tabs defaultValue="signin" className="w-full">
             <TabsList className="grid w-full grid-cols-2">

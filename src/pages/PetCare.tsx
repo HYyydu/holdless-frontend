@@ -99,7 +99,7 @@ const PetCare = () => {
   const [pets, setPets] = useState<Pet[]>(initialPets);
   const [selectedPetId, setSelectedPetId] = useState<string | null>(initialPets[0]?.id || null);
   const [tasks, setTasks] = useState<PetTask[]>(samplePetTasks);
-  const [activeTab, setActiveTab] = useState<'tasks' | 'activity' | 'profile'>('tasks');
+  const [activeTab, setActiveTab] = useState<'tasks' | 'profile'>('tasks');
   const [quoteDialogOpen, setQuoteDialogOpen] = useState(false);
   const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
   const [selectedTask, setSelectedTask] = useState<PetTask | null>(null);

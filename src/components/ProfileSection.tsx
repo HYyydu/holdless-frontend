@@ -1,22 +1,13 @@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { 
   User, 
   Phone, 
-  Mail, 
   MapPin, 
   Shield, 
-  Link as LinkIcon,
-  Settings,
-  CreditCard,
-  Package,
-  CheckCircle,
-  AlertTriangle,
   Calendar,
   IdCard
 } from "lucide-react";
@@ -33,14 +24,6 @@ const usStates = [
   "Wisconsin", "Wyoming", "District of Columbia"
 ];
 
-interface ConnectedAccount {
-  id: string;
-  provider: string;
-  email: string;
-  status: 'connected' | 'error' | 'pending';
-  lastSync?: Date;
-}
-
 interface ProfileSectionProps {
   profile: {
     name: string;
@@ -53,28 +36,10 @@ interface ProfileSectionProps {
     tone: string;
     language: string;
   };
-  connectedAccounts: ConnectedAccount[];
   onUpdateProfile: (field: string, value: string) => void;
-  onConnectAccount: (provider: string) => void;
 }
 
-export function ProfileSection({ profile, connectedAccounts, onUpdateProfile, onConnectAccount }: ProfileSectionProps) {
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case 'connected': return <CheckCircle className="w-4 h-4 text-accent" />;
-      case 'error': return <AlertTriangle className="w-4 h-4 text-destructive" />;
-      default: return <AlertTriangle className="w-4 h-4 text-warning" />;
-    }
-  };
-
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'connected': return 'success';
-      case 'error': return 'destructive';
-      default: return 'warning';
-    }
-  };
-
+export function ProfileSection({ profile, onUpdateProfile }: ProfileSectionProps) {
   return (
     <div className="space-y-6">
       {/* Personal Information */}
@@ -212,71 +177,6 @@ export function ProfileSection({ profile, connectedAccounts, onUpdateProfile, on
                   <SelectItem value="chinese">Chinese</SelectItem>
                 </SelectContent>
               </Select>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Connected Accounts */}
-      <Card className="shadow-card">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <LinkIcon className="w-5 h-5" />
-            Connected Accounts
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            Link your accounts to automatically fetch order information and streamline support requests.
-          </p>
-          
-          <div className="space-y-3">
-            {connectedAccounts.map((account) => (
-              <div key={account.id} className="flex items-center justify-between p-3 border border-border rounded-lg">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 bg-primary/10 rounded-lg flex items-center justify-center">
-                    {account.provider === 'Amazon' && <Package className="w-5 h-5 text-primary" />}
-                    {account.provider === 'Google' && <Mail className="w-5 h-5 text-primary" />}
-                  </div>
-                  <div>
-                    <h3 className="font-medium">{account.provider}</h3>
-                    <p className="text-sm text-muted-foreground">{account.email}</p>
-                    {account.lastSync && (
-                      <p className="text-xs text-muted-foreground">
-                        Last sync: {account.lastSync.toLocaleDateString()}
-                      </p>
-                    )}
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  {getStatusIcon(account.status)}
-                  <Badge variant={getStatusColor(account.status) as any}>
-                    {account.status}
-                  </Badge>
-                </div>
-              </div>
-            ))}
-            
-            {/* Add New Account Options */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2">
-              <Button 
-                variant="outline" 
-                className="justify-start"
-                onClick={() => onConnectAccount('Amazon')}
-                disabled={connectedAccounts.some(a => a.provider === 'Amazon')}
-              >
-                <Package className="w-4 h-4" />
-                Connect Amazon
-              </Button>
-              <Button 
-                variant="outline" 
-                className="justify-start"
-                onClick={() => onConnectAccount('Google')}
-                disabled={connectedAccounts.some(a => a.provider === 'Google')}
-              >
-                <Mail className="w-4 h-4" />
-                Connect Google
-              </Button>
             </div>
           </div>
         </CardContent>

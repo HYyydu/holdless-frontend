@@ -1,10 +1,8 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useRef, useCallback } from 'react';
 import { Task } from '@/components/TaskCard';
 import { NewTaskDialog } from '@/components/NewTaskDialog';
 import { TaskDetailsDialog } from '@/components/TaskDetailsDialog';
 import { SimulationModal } from '@/components/SimulationModal';
-import { ActivityItem } from '@/components/ActivityCard';
-import { ActivityDetailsDialog } from '@/components/ActivityDetailsDialog';
 import { AdditionalInfoDialog } from '@/components/AdditionalInfoDialog';
 import { ProfileSection } from '@/components/ProfileSection';
 import { PetProfilesSection } from '@/components/PetProfilesSection';
@@ -12,21 +10,19 @@ import { StatusStrip } from '@/components/dashboard/StatusStrip';
 import { SavingsModule } from '@/components/dashboard/SavingsModule';
 import { TaskFilters, TaskFilter } from '@/components/dashboard/TaskFilters';
 import { SmartTaskCard } from '@/components/dashboard/SmartTaskCard';
-import { ActivityFeed } from '@/components/dashboard/ActivityFeed';
 import { DashboardSidebar, DashboardTab } from '@/components/dashboard/DashboardSidebar';
 import { AIChatHome } from '@/components/dashboard/AIChatHome';
 import { ConversationView, CallTask } from '@/components/dashboard/ConversationView';
 import { TasksView } from '@/components/dashboard/TasksView';
 import { LiveTranscriptModal } from '@/components/dashboard/LiveTranscriptModal';
-import { Card, CardContent } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Activity } from 'lucide-react';
+import { TokensView } from '@/components/dashboard/TokensView';
 import { useUserProfile } from '@/hooks/useUserProfile';
 import { usePets } from '@/hooks/usePets';
 import { useTasks, taskToPayload } from '@/hooks/useTasks';
 import { useDemoAuth } from '@/contexts/DemoAuthContext';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
-import { summarizeCall, retryCall } from '@/lib/chatApi';
+import { summarizeCall, retryCall, getCallStatusWithMeta } from '@/lib/chatApi';
+import { useCallUsageSocket } from '@/hooks/useCallUsageSocket';
 
 // Sample data with vendor logos
 const sampleTasks: Task[] = [
@@ -66,83 +62,12 @@ const sampleTasks: Task[] = [
   }
 ];
 
-const sampleActivity: ActivityItem[] = [
-  {
-    id: '1',
-    vendor: 'Amazon',
-    type: 'alert',
-    title: 'Return Window Alert',
-    description: 'Return window ends in 3 days (Amazon shoes)',
-    timestamp: new Date(Date.now() - 30 * 60 * 1000),
-    outcome: {
-      type: 'alert',
-      urgency: 'high',
-      deadline: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
-    }
-  },
-  {
-    id: '2',
-    vendor: 'Amazon',
-    type: 'task_completed',
-    title: 'Return Label Issued',
-    description: 'Successfully requested return for wrong size shoes. Exchange approved.',
-    timestamp: new Date(Date.now() - 60 * 60 * 1000),
-    outcome: {
-      type: 'document',
-      caseNumber: 'RMA123456',
-      downloadUrl: '#'
-    },
-    transcriptUrl: '#'
-  },
-  {
-    id: '3',
-    vendor: 'Chase Bank',
-    type: 'refund_issued',
-    title: 'Fee Reversal Approved',
-    description: 'Overdraft fee was reversed after explaining the error in automatic payment timing.',
-    timestamp: new Date(Date.now() - 3 * 60 * 60 * 1000),
-    outcome: {
-      type: 'refund',
-      amount: '$35.00',
-      caseNumber: 'CB789012'
-    }
-  },
-  {
-    id: '4',
-    vendor: 'Best Buy',
-    type: 'alert',
-    title: 'Warranty Expiration',
-    description: 'Extended warranty expires in 7 days (MacBook Pro)',
-    timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000),
-    outcome: {
-      type: 'alert',
-      urgency: 'medium',
-      deadline: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
-    }
-  },
-  {
-    id: '5',
-    vendor: 'Comcast',
-    type: 'appointment_scheduled',
-    title: 'Installation Scheduled',
-    description: 'Successfully scheduled internet installation for new home.',
-    timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000),
-    outcome: {
-      type: 'appointment',
-      date: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
-    }
-  }
-];
-
 const Dashboard = () => {
   const [activeTab, setActiveTab] = useState<DashboardTab>('ai-chat');
-  const [activity, setActivity] = useState<ActivityItem[]>(sampleActivity);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [taskDetailsOpen, setTaskDetailsOpen] = useState(false);
   const [simulationOpen, setSimulationOpen] = useState(false);
   const [simulationTask, setSimulationTask] = useState<Task | null>(null);
-  const [activityDetailsOpen, setActivityDetailsOpen] = useState(false);
-  const [selectedActivity, setSelectedActivity] = useState<ActivityItem | null>(null);
   const [additionalInfoOpen, setAdditionalInfoOpen] = useState(false);
   const [additionalInfoTask, setAdditionalInfoTask] = useState<Task | null>(null);
   const [newTaskDialogOpen, setNewTaskDialogOpen] = useState(false);
@@ -166,6 +91,7 @@ const Dashboard = () => {
     callId: string | null;
     label: string;
   }>({ open: false, callId: null, label: '' });
+  const [freeTrialRemaining, setFreeTrialRemaining] = useState<number | null>(null);
 
   // Filter states
   const [activeFilter, setActiveFilter] = useState<TaskFilter>('all');
@@ -203,23 +129,6 @@ const Dashboard = () => {
   const transcriptTask = transcriptFromTask.callId
     ? callTasks.find((t) => t.callId === transcriptFromTask.callId)
     : null;
-
-  const connectedAccounts = [
-    {
-      id: '1',
-      provider: 'Amazon',
-      email: 'sarah.chen@email.com',
-      status: 'connected' as const,
-      lastSync: new Date(Date.now() - 2 * 60 * 60 * 1000)
-    },
-    {
-      id: '2',
-      provider: 'Google',
-      email: 'sarah.chen@gmail.com',
-      status: 'connected' as const,
-      lastSync: new Date(Date.now() - 60 * 60 * 1000)
-    }
-  ];
 
   // Task filtering logic
   const filteredTasks = useMemo(() => {
@@ -336,6 +245,52 @@ const Dashboard = () => {
     }
   };
 
+  const persistCallTokensRef = useRef<
+    (callId: string, patch: Record<string, unknown>) => void | Promise<void>
+  >(async () => {});
+
+  persistCallTokensRef.current = async (callId: string, patch: Record<string, unknown>) => {
+    const task = callTasks.find((t) => t.callId === callId);
+    const status: "in_progress" | "resolved" = task?.status === "resolved" ? "resolved" : "in_progress";
+    await handleCallTaskStatusUpdate(callId, status, patch);
+  };
+
+  const isReplayTranscript =
+    typeof transcriptTask?.payload?.transcript === "string" &&
+    String(transcriptTask.payload.transcript).trim().length > 0;
+
+  const liveTranscriptModalForUsage =
+    transcriptFromTask.open && Boolean(transcriptFromTask.callId) && !isReplayTranscript;
+
+  const activeCallIdsForUsage = useMemo(() => {
+    const ids = callTasks.filter((t) => t.status === "in_progress").map((t) => t.callId);
+    if (liveTranscriptModalForUsage && transcriptFromTask.callId) {
+      return ids.filter((id) => id !== transcriptFromTask.callId);
+    }
+    return ids;
+  }, [callTasks, liveTranscriptModalForUsage, transcriptFromTask.callId]);
+
+  useCallUsageSocket(activeCallIdsForUsage, {
+    callBackendToken,
+    onPersistUsage: (callId, patch) => persistCallTokensRef.current(callId, patch),
+  });
+
+  const mergeTokensFromCallApi = useCallback(
+    async (callId: string) => {
+      const meta = await getCallStatusWithMeta(callId, {
+        callBackendToken: callBackendToken ?? undefined,
+      });
+      if (!meta.ok || !meta.data) return;
+      const d = meta.data as Record<string, unknown>;
+      const patch: Record<string, unknown> = {};
+      if (typeof d.input_tokens === "number") patch.input_tokens = d.input_tokens;
+      if (typeof d.output_tokens === "number") patch.output_tokens = d.output_tokens;
+      if (Object.keys(patch).length === 0) return;
+      await persistCallTokensRef.current(callId, patch);
+    },
+    [callBackendToken],
+  );
+
   const handleRetryCall = async (
     callId: string,
     purpose: string
@@ -358,10 +313,6 @@ const Dashboard = () => {
 
   const handleUpdateProfile = (field: string, value: string) => {
     updateProfile(field, value);
-  };
-
-  const handleConnectAccount = (provider: string) => {
-    console.log(`Connecting to ${provider}...`);
   };
 
   const handleViewTaskDetails = (taskId: string) => {
@@ -418,22 +369,6 @@ const Dashboard = () => {
     }
   };
 
-  const handleViewActivityDetails = (activity: ActivityItem) => {
-    setSelectedActivity(activity);
-    setActivityDetailsOpen(true);
-  };
-
-  const handleViewTranscript = (activityId: string) => {
-    const activity = sampleActivity.find(a => a.id === activityId);
-    if (activity) {
-      handleViewActivityDetails(activity);
-    }
-  };
-
-  const handleDownloadDocument = (url: string) => {
-    console.log('Downloading document from:', url);
-  };
-
   const handleSubmitAdditionalInfo = async (taskId: string, additionalInfo: string) => {
     if (userId) {
       await updateTaskById(taskId, { status: 'in_progress' });
@@ -475,6 +410,7 @@ const Dashboard = () => {
             onTaskCreated={handleTaskCreatedFromConversation}
             onCallTaskCreated={handleCallTaskCreated}
             onCallTaskStatusUpdate={handleCallTaskStatusUpdate}
+            onFreeTrialRemainingChange={setFreeTrialRemaining}
           />
         )}
 
@@ -489,6 +425,7 @@ const Dashboard = () => {
               setTranscriptFromTask({ open: true, callId, label })
             }
             onCallEnded={async (callId) => {
+              await mergeTokensFromCallApi(callId);
               const task = callTasks.find((t) => t.callId === callId);
               const purpose = task?.description || task?.title || '';
               await handleCallTaskStatusUpdate(callId, 'resolved');
@@ -506,47 +443,12 @@ const Dashboard = () => {
           />
         )}
 
-        {activeTab === 'activity' && (
-          <div className="flex-1 p-8 max-w-5xl mx-auto w-full bg-[hsl(250_30%_99%)]">
-            <div className="space-y-8">
-              {/* Page Header */}
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 bg-gray-100 rounded-xl flex items-center justify-center">
-                    <Activity className="w-5 h-5 text-gray-600" />
-                  </div>
-                  <div>
-                    <h1 className="text-2xl font-bold text-gray-900">Activity</h1>
-                    <p className="text-sm text-gray-500">Track your call outcomes and alerts</p>
-                  </div>
-                </div>
-                <Badge variant="secondary" className="text-xs bg-gray-100 text-gray-600">
-                  {activity.length} items
-                </Badge>
-              </div>
-              
-              {activity.length > 0 ? (
-                <ActivityFeed 
-                  activities={activity}
-                  onViewTranscript={handleViewTranscript}
-                  onDownload={handleDownloadDocument}
-                  onViewDetails={handleViewActivityDetails}
-                />
-              ) : (
-                <Card className="border-dashed border-2 border-gray-200">
-                  <CardContent className="py-16 text-center">
-                    <div className="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center mx-auto mb-4">
-                      <Activity className="w-6 h-6 text-gray-400" />
-                    </div>
-                    <h3 className="text-lg font-semibold text-gray-900 mb-2">No activity yet</h3>
-                    <p className="text-gray-500 text-sm max-w-sm mx-auto">
-                      Your task history and updates will appear here
-                    </p>
-                  </CardContent>
-                </Card>
-              )}
-            </div>
-          </div>
+        {activeTab === 'tokens' && (
+          <TokensView
+            callTasks={callTasks}
+            onOpenSettings={() => setActiveTab('settings')}
+            freeTrialRemaining={freeTrialRemaining}
+          />
         )}
 
         {activeTab === 'profile' && (
@@ -556,9 +458,7 @@ const Dashboard = () => {
                 <h2 className="text-2xl font-bold text-gray-900">Profile Settings</h2>
                 <ProfileSection 
                   profile={profile}
-                  connectedAccounts={connectedAccounts}
                   onUpdateProfile={handleUpdateProfile}
-                  onConnectAccount={handleConnectAccount}
                 />
                 <PetProfilesSection pets={pets} onAddPet={addPet} addError={addError} />
               </div>
@@ -595,11 +495,6 @@ const Dashboard = () => {
         onStatusChange={handleTaskStatusChange}
         onComplete={handleSimulationComplete}
       />
-      <ActivityDetailsDialog 
-        activity={selectedActivity}
-        open={activityDetailsOpen}
-        onOpenChange={setActivityDetailsOpen}
-      />
       <AdditionalInfoDialog
         task={additionalInfoTask}
         open={additionalInfoOpen}
@@ -630,9 +525,11 @@ const Dashboard = () => {
               return d != null ? String(d) : undefined;
             })()
           }
+          onPersistCallTokens={(callId, patch) => persistCallTokensRef.current(callId, patch)}
           onCallComplete={async (quote, transcriptText, callDuration) => {
             if (transcriptFromTask.callId) {
               const callId = transcriptFromTask.callId;
+              await mergeTokensFromCallApi(callId);
               await handleCallTaskStatusUpdate(callId, 'resolved', {
                 transcript: transcriptText,
                 quote,

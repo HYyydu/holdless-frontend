@@ -1,8 +1,8 @@
 import { cn } from '@/lib/utils';
-import { MessageSquare, CheckSquare, Activity, User, Settings } from 'lucide-react';
+import { MessageSquare, CheckSquare, User, Settings, Coins } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import holdlessHLogo from '@/assets/holdless-h-logo-new.png';
-export type DashboardTab = 'ai-chat' | 'tasks' | 'activity' | 'profile' | 'settings';
+export type DashboardTab = 'ai-chat' | 'tasks' | 'tokens' | 'profile' | 'settings';
 interface DashboardSidebarProps {
   activeTab: DashboardTab;
   onTabChange: (tab: DashboardTab) => void;
@@ -22,9 +22,9 @@ const navItems: {
   label: 'Tasks',
   icon: CheckSquare
 }, {
-  key: 'activity',
-  label: 'Activity',
-  icon: Activity
+  key: 'tokens',
+  label: 'Tokens',
+  icon: Coins
 }, {
   key: 'profile',
   label: 'Profile',

@@ -76,6 +76,9 @@ export interface CallStatus {
   startedAt?: string;
   endedAt?: string;
   cost?: number;
+  /** Cumulative Realtime usage when call backend persists them (GET /api/calls/:id). */
+  input_tokens?: number;
+  output_tokens?: number;
 }
 
 export interface GetCallStatusOptions {
@@ -529,6 +532,9 @@ export async function sendChatMessage(
   conversation_id: string;
   debug_state: string;
   ui_options?: unknown[];
+  free_trial_remaining?: number;
+  error?: string;
+  code?: string;
 } | null> {
   const body: Record<string, unknown> = {
     user_id: userId,
@@ -584,6 +590,9 @@ export async function sendChatMessage(
       callReason?: string;
       /** Intent domain (e.g. pet_services) - set by Node when call is placed */
       domain?: string;
+      free_trial_remaining?: number;
+      error?: string;
+      code?: string;
     };
   } catch (e) {
     console.warn("[History] sendChatMessage failed", e);

@@ -12,12 +12,21 @@
  *   TWILIO_PHONE_NUMBER=+1...   (optional – reference)
  */
 import "dotenv/config";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const distPath = path.join(__dirname, "..", "dist");
+const spaIndex = path.join(distPath, "index.html");
+const serveSpa = fs.existsSync(spaIndex);
+
 const app = express();
-const PORT = process.env.CHAT_SERVER_PORT || 3001;
+// Railway sets PORT; local dev often uses CHAT_SERVER_PORT=3001
+const PORT = Number(process.env.PORT || process.env.CHAT_SERVER_PORT || 3001);
 
 app.use(cors());
 app.use(express.json());
@@ -95,23 +104,25 @@ function getCallBackendToken(req) {
   return bearer || fromBody || "";
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    message: "Holdless chat API",
-    chat: "POST /api/chat",
-    intentClassify: "POST /api/intent/classify (body: { message })",
-    callStatus: "GET /api/call/:callId",
-    callBackendAuth:
-      "POST /api/auth/call-backend/signin, POST /api/auth/call-backend/refresh",
-    calls: USE_CALL_BACKEND
-      ? "Calls via GPT-4o Realtime backend at " +
-        CALL_BACKEND_URL +
-        " (token from sign-in or CALL_API_TOKEN)"
-      : "Calls disabled (configure CALL_BACKEND_URL)",
-    docs: "Frontend at http://localhost:8080 – chat and outbound calls via GPT-4o Realtime call backend.",
+if (!serveSpa) {
+  app.get("/", (req, res) => {
+    res.json({
+      ok: true,
+      message: "Holdless chat API",
+      chat: "POST /api/chat",
+      intentClassify: "POST /api/intent/classify (body: { message })",
+      callStatus: "GET /api/call/:callId",
+      callBackendAuth:
+        "POST /api/auth/call-backend/signin, POST /api/auth/call-backend/refresh",
+      calls: USE_CALL_BACKEND
+        ? "Calls via GPT-4o Realtime backend at " +
+          CALL_BACKEND_URL +
+          " (token from sign-in or CALL_API_TOKEN)"
+        : "Calls disabled (configure CALL_BACKEND_URL)",
+      docs: "Frontend at http://localhost:8080 – chat and outbound calls via GPT-4o Realtime call backend.",
+    });
   });
-});
+}
 
 // Proxy to Python backend (Supabase: pet profiles, conversations, state-machine chat).
 // When frontend uses Node (VITE_API_TARGET=3001), these routes are forwarded so Profile pets and History work.
@@ -1714,6 +1725,15 @@ app.get("/api/calls/:callId/transcripts", async (req, res) => {
       .json({ error: "Call backend unavailable", detail: err.message });
   }
 });
+
+// Production: Vite build in ../dist (same origin as /api — required for Railway and static hosts)
+if (serveSpa) {
+  app.use(express.static(distPath));
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api")) return next();
+    res.sendFile(spaIndex, (err) => (err ? next(err) : undefined));
+  });
+}
 
 function tryListen(port) {
   const server = app.listen(port, () => {

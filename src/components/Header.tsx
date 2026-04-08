@@ -1,11 +1,11 @@
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { User, Activity, PawPrint } from "lucide-react";
+import { User, PawPrint } from "lucide-react";
 import { useNavigate, useLocation } from "react-router-dom";
 
 interface HeaderProps {
-  activeTab: 'tasks' | 'activity' | 'profile';
-  onTabChange: (tab: 'tasks' | 'activity' | 'profile') => void;
+  activeTab: 'tasks' | 'profile';
+  onTabChange: (tab: 'tasks' | 'profile') => void;
   pendingTasksCount: number;
 }
 
@@ -63,14 +63,6 @@ export function Header({ activeTab, onTabChange, pendingTasksCount }: HeaderProp
                       {pendingTasksCount}
                     </Badge>
                   )}
-                </Button>
-                <Button
-                  variant={activeTab === 'activity' ? 'primary' : 'ghost'}
-                  size="sm"
-                  onClick={() => onTabChange('activity')}
-                >
-                  <Activity className="w-4 h-4" />
-                  Activity
                 </Button>
                 <Button
                   variant={activeTab === 'profile' ? 'primary' : 'ghost'}

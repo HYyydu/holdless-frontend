@@ -10,6 +10,8 @@ import {
   isCallEndedStatus,
 } from '@/lib/chatApi';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
+import { toast } from 'sonner';
+import { parseUsageUpdatePayload } from '@/lib/callUsageTypes';
 
 interface TranscriptLine {
   speaker: 'clinic' | 'ai';
@@ -47,6 +49,8 @@ interface LiveTranscriptModalProps {
   /** When provided with initialTranscript, display this as the call duration (e.g. "2:15"). */
   initialCallDuration?: string | null;
   onCallComplete: (quote: string, includes: string, callDuration: string) => void;
+  /** Persist Realtime token usage (Socket.IO usage_update / call_ended); merged into call task payload. */
+  onPersistCallTokens?: (callId: string, patch: Record<string, unknown>) => void | Promise<void>;
 }
 
 /** call_ended event payload (CREATE_CALL_API.md § Getting Live Transcripts). Strong signal: call ended → update UI, stop live state. */
@@ -55,6 +59,7 @@ interface CallEndedPayload {
   outcome?: string;
   duration: number;
   ended_at?: string;
+  end_reason?: 'token_budget';
 }
 
 const transcriptScript: Omit<TranscriptLine, 'timestamp'>[] = [
@@ -116,9 +121,12 @@ export function LiveTranscriptModal({
   callId,
   initialTranscript,
   initialCallDuration,
-  onCallComplete 
+  onCallComplete,
+  onPersistCallTokens,
 }: LiveTranscriptModalProps) {
   const { callBackendToken } = useCallBackendAuth();
+  const onPersistCallTokensRef = useRef(onPersistCallTokens);
+  onPersistCallTokensRef.current = onPersistCallTokens;
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [currentLineIndex, setCurrentLineIndex] = useState(0);
   const [isCallActive, setIsCallActive] = useState(true);
@@ -345,6 +353,36 @@ export function LiveTranscriptModal({
             socket?.emit('subscribe', { callId }); // optional; backends that use it can treat same as join_call
           });
 
+          socket.on('usage_update', (payload: unknown) => {
+            const p = parseUsageUpdatePayload(payload);
+            if (!p || p.call_id !== callId) return;
+            void onPersistCallTokensRef.current?.(p.call_id, {
+              input_tokens: p.input_tokens,
+              output_tokens: p.output_tokens,
+              total_tokens: p.total_tokens,
+              limit_tokens: p.limit_tokens,
+              percent_of_limit: p.percent_of_limit,
+            });
+          });
+
+          socket.on('quota_warning', (payload: unknown) => {
+            const o = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
+            if (o.call_id !== callId) return;
+            const th = typeof o.threshold === 'number' ? o.threshold : 0;
+            toast.warning(`About ${Math.round(th * 100)}% of call usage reached`, {
+              description: 'You are approaching the usage limit for this call.',
+            });
+          });
+
+          socket.on('call_ending', (payload: unknown) => {
+            const o = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
+            if (o.call_id !== callId) return;
+            if (o.reason === 'token_budget') {
+              const msg = typeof o.message === 'string' ? o.message : 'This call is ending due to usage limits.';
+              toast.info(msg);
+            }
+          });
+
           // Single-segment events (backend may emit transcript_line or transcript with one segment)
           const appendSegment = (t: Record<string, unknown>) => {
             setTranscript((prev) => {
@@ -436,6 +474,22 @@ export function LiveTranscriptModal({
           // Strong "call ended" signal from backend (CREATE_CALL_API.md § Getting Live Transcripts).
           socket.on('call_ended', (payload?: unknown) => {
             const data = (typeof payload === 'object' && payload !== null ? payload : {}) as CallEndedPayload & Record<string, unknown>;
+            if (data.end_reason === 'token_budget') {
+              void onPersistCallTokensRef.current?.(callId, { call_end_reason: 'token_budget' });
+            }
+            if (typeof data.outcome === 'string') {
+              void onPersistCallTokensRef.current?.(callId, { call_outcome: data.outcome });
+            }
+            void (async () => {
+              const meta = await getCallStatusWithMeta(callId, callStatusOpts);
+              if (meta.ok && meta.data) {
+                const d = meta.data as Record<string, unknown>;
+                const patch: Record<string, unknown> = {};
+                if (typeof d.input_tokens === 'number') patch.input_tokens = d.input_tokens;
+                if (typeof d.output_tokens === 'number') patch.output_tokens = d.output_tokens;
+                if (Object.keys(patch).length) await onPersistCallTokensRef.current?.(callId, patch);
+              }
+            })();
             const payloadDur = typeof data.duration === 'number' ? data.duration : 0;
             const finalDuration = Math.max(payloadDur, duration());
             setCallDuration(finalDuration);

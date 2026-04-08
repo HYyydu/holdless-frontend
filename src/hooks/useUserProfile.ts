@@ -15,15 +15,15 @@ export interface UserProfile {
 const STORAGE_KEY = 'holdless_user_profile';
 
 const defaultProfile: UserProfile = {
-  name: 'Sarah Chen',
-  email: 'sarah.chen@email.com',
-  phone: '+1 (555) 123-4567',
-  address: '123 Main St, Los Angeles, CA 90007',
-  dateOfBirth: '1990-05-15',
-  state: 'California',
-  zipCode: '90007',
-  tone: 'polite',
-  language: 'english',
+  name: '',
+  email: '',
+  phone: '',
+  address: '',
+  dateOfBirth: '',
+  state: '',
+  zipCode: '',
+  tone: '',
+  language: '',
 };
 
 export function useUserProfile() {

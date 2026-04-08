@@ -50,6 +50,8 @@ interface ConversationViewProps {
     callId: string,
     status: "in_progress" | "resolved",
   ) => void;
+  /** Remaining free call requests reported by backend after successful call creation. */
+  onFreeTrialRemainingChange?: (remaining: number) => void;
 }
 
 interface Clinic {
@@ -201,6 +203,7 @@ export function ConversationView({
   onTaskCreated,
   onCallTaskCreated,
   onCallTaskStatusUpdate,
+  onFreeTrialRemainingChange,
 }: ConversationViewProps) {
   const { user } = useDemoAuth();
   const { callBackendToken } = useCallBackendAuth();
@@ -513,6 +516,9 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
       setMessages((prev) => [...prev, assistantMessage]);
       setIsThinking(false);
       if (data?.callId) {
+        if (typeof data.free_trial_remaining === "number") {
+          onFreeTrialRemainingChange?.(data.free_trial_remaining);
+        }
         const purpose = data.callReason ?? buttonLabel.slice(0, 80);
         const taskId = data.task_id;
         if (onCallTaskCreated) {
@@ -606,6 +612,9 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
       setMessages((prev) => [...prev, assistantMessage]);
       setIsThinking(false);
       if (data?.callId) {
+        if (typeof data.free_trial_remaining === "number") {
+          onFreeTrialRemainingChange?.(data.free_trial_remaining);
+        }
         const purpose = data.callReason ?? text.slice(0, 80);
         const taskId = data.task_id;
         if (onCallTaskCreated) {
