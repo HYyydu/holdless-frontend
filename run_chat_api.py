@@ -12,7 +12,8 @@ try:
 except ImportError:
     pass
 
-port = int(os.environ.get("PYTHON_API_PORT", "8000"))
+# Railway injects PORT. Keep PYTHON_API_PORT for local/dev override.
+port = int(os.environ.get("PORT") or os.environ.get("PYTHON_API_PORT", "8000"))
 
 if __name__ == "__main__":
     import uvicorn

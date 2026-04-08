@@ -2,9 +2,14 @@
   "$schema": "https://schema.railpack.com",
   "provider": "python",
   "packages": {
-    "python": "3.12"
+    "python": "3.11"
+  },
+  "steps": {
+    "build": {
+      "commands": ["pip install -r requirements.txt"]
+    }
   },
   "deploy": {
-    "startCommand": "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    "startCommand": "python run_chat_api.py"
   }
 }
