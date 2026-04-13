@@ -1123,7 +1123,7 @@ app.post("/api/chat", async (req, res) => {
           data.task_id &&
           USE_CALL_BACKEND
         ) {
-          const callReason = data.call_reason || "Veterinary price inquiry";
+          const callReason = data.call_reason || "Veterinary service inquiry";
           const token = getCallBackendToken(req);
           const userId = req.body?.user_id || "";
           const taskId = data.task_id;

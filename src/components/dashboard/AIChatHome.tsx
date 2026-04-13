@@ -184,8 +184,8 @@ export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AICh
 
   if (selectedConversation) {
     return (
-      <div className="flex-1 flex flex-col bg-[hsl(250_30%_99%)]">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-[hsl(240_30%_92%)] bg-white/80">
+      <div className="flex-1 flex flex-col min-h-0 bg-[hsl(250_30%_99%)]">
+        <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 border-b border-[hsl(240_30%_92%)] bg-white/80">
           <button
             onClick={handleBackFromHistory}
             className="text-sm font-medium text-[hsl(240_20%_40%)] hover:text-[hsl(250_60%_50%)]"
@@ -200,7 +200,7 @@ export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AICh
             Continue conversation
           </button>
         </div>
-        <div className="flex-1 overflow-auto px-6 py-6 max-w-2xl mx-auto w-full space-y-4">
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6 max-w-2xl mx-auto w-full space-y-4">
           {selectedConversation.messages.map((m) => (
             <div
               key={m.id}

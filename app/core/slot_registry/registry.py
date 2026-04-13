@@ -15,6 +15,8 @@ class SlotRegistry:
 
     _registry: dict[tuple[str, str], list["SlotDefinition"]] = {
         ("pet", "price_quote"): PET_PRICE_QUOTE,
+        # Same slots: booking vs quote both need ZIP, service, pet details, and call purpose.
+        ("pet", "booking"): PET_PRICE_QUOTE,
         ("retail", "complaint"): RETURN_SERVICE,
     }
 

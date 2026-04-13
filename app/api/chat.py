@@ -102,10 +102,10 @@ def _context_for_redis(context: dict) -> dict:
 
 
 def _show_clinic_selection(context: dict) -> tuple[dict, str, list]:
-    """Fetch clinics for the area (context['zip']); return context + reply + ui_options for AWAITING_CLINIC_SELECTION.
-    Currently uses get_fake_clinics(). To use Google Maps/Places by ZIP, replace with a call that takes context['zip']."""
-    from app.services.fake_clinics import get_fake_clinics
-    clinics = get_fake_clinics()  # TODO: pass context.get('zip') when using Places API
+    """Fetch clinics for the area (context['zip']): Google Places when configured, else demo list."""
+    from app.services.places_search import resolve_clinics_near_zip
+
+    clinics = resolve_clinics_near_zip(context.get("zip"))
     new_ctx = {**context, "clinic_candidates": [dict(c) for c in clinics]}
     lines = ["Here are some clinics near you:"]
     for i, c in enumerate(clinics, 1):
@@ -484,7 +484,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             if persisted_context.get("flow_type") == FLOW_GENERAL_BUSINESS_QUOTE
             else "Information gathering"
             if persisted_context.get("flow_type") == FLOW_GENERAL_CALL
-            else "Veterinary price inquiry"
+            else "Veterinary service inquiry"
         )
         call_reason_effective = persisted_context.get("call_reason") or default_reason
         payload = {
@@ -549,7 +549,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
         result["task_id"] = task_id
         result["hospital_phone"] = persisted_context.get("hospital_phone")
         result["call_reason"] = call_reason_effective or (
-            persisted_context.get("call_reason") or "Veterinary price inquiry"
+            persisted_context.get("call_reason") or "Veterinary service inquiry"
         )
         if placed_call_id:
             result["callId"] = placed_call_id

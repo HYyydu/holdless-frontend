@@ -5,9 +5,19 @@ import re
 from enum import Enum
 from typing import Any
 
-from app.services.fake_clinics import get_fake_clinics
+from app.services.places_search import resolve_clinics_near_zip
 
 MAX_CLINIC_SELECTIONS = 4
+
+
+def _apply_selected_clinics_phone(context: dict[str, Any], selected: list[dict]) -> None:
+    """First selected clinic drives outbound call (chat.py uses hospital_phone)."""
+    context["selected_clinics"] = selected
+    if not selected:
+        return
+    p = (selected[0].get("phone") or "").strip()
+    if p:
+        context["hospital_phone"] = p
 ZIP_PATTERN = re.compile(r"^\d{5}(-\d{4})?$")
 # US NANP: optional +1/1, then 10 digits with optional separators (used for extraction and stripping)
 _PHONE_PATTERN = re.compile(
@@ -93,6 +103,37 @@ def _normalize_phone(msg: str) -> str | None:
     return None
 
 
+def _fallback_vet_purpose_from_message(msg: str) -> str | None:
+    """When structured patterns miss, infer a short vet purpose from keywords (appointment vs price)."""
+    low = (msg or "").lower()
+    if not any(
+        k in low
+        for k in (
+            "vet",
+            "veterinar",
+            "pet hospital",
+            "animal hospital",
+            "clinic",
+            "neuter",
+            "spay",
+            "neutering",
+        )
+    ):
+        return None
+    species = "pet"
+    if "cat" in low or "kitten" in low:
+        species = "cat"
+    elif "dog" in low or "puppy" in low:
+        species = "dog"
+    if "neuter" in low or "spay" in low or "neutering" in low:
+        if any(x in low for x in ("appointment", "schedule", "book", "make an appointment")):
+            return f"Schedule a {species} neuter/spay appointment; confirm pricing, prep, and availability"
+        return f"{species} neuter/spay pricing and availability"
+    if any(x in low for x in ("appointment", "schedule", "book")):
+        return "Veterinary appointment scheduling and details"
+    return None
+
+
 def _extract_call_reason(msg: str) -> str | None:
     """Extract call purpose from a message.
 
@@ -110,6 +151,13 @@ def _extract_call_reason(msg: str) -> str | None:
         m,
         flags=re.IGNORECASE,
     ).strip()
+    # Strip common search preamble so patterns hit the real intent ("... call them to ...")
+    m = re.sub(
+        r"^(?:search|find)\s+(?:nearby\s+)?(?:a\s+)?(?:pet\s+)?(?:vet(?:erinary)?|hospital|clinic)s?\s+(?:near\s+me\s+)?(?:and\s+)?",
+        "",
+        m,
+        flags=re.IGNORECASE,
+    ).strip()
     # Chinese: purpose after 来问 / 询问 / 咨询 / 了解 (before sentence end)
     for pat in (
         r"来问(.+?)(?:\s*$|[。．，,])",
@@ -123,6 +171,45 @@ def _extract_call_reason(msg: str) -> str | None:
             extracted = _strip_phone_numbers(extracted)
             if extracted:
                 return extracted[:120]
+    # Scheduling / appointment phrasing (before generic "for/about" and before "call them" as delivery)
+    appointment_first = [
+        r"(?:make|book|schedule)\s+an?\s+appointment(?:\s+for|\s+in\s+getting|\s+to\s+get)?\s+(.+)",
+        r"(?:make|book|schedule)\s+an?\s+appointment\s+to\s+(.+)",
+        r"appointment\s+(?:for|to\s+get|in\s+getting)\s+(.+)",
+        r"in\s+getting\s+(.+?)(?:\.|$)",
+    ]
+    for pat in appointment_first:
+        match = re.search(pat, m, re.IGNORECASE | re.DOTALL)
+        if match:
+            extracted = match.group(1).strip()
+            extracted = _strip_phone_numbers(extracted)
+            while True:
+                trimmed = re.sub(
+                    r"\b(?:to|call|dial|phone)\b\s*$",
+                    "",
+                    extracted,
+                    flags=re.IGNORECASE,
+                ).strip()
+                if trimmed == extracted:
+                    break
+                extracted = trimmed
+            if extracted:
+                # Keep scheduling intent: "make an appointment ... in getting a cat neuter" → not just "a cat neuter service"
+                if "appointment" in m.lower() and re.match(r"^(a|an)\s+", extracted, re.I):
+                    rest = re.sub(r"^(a|an)\s+", "", extracted, count=1, flags=re.I).strip()
+                    if rest:
+                        extracted = f"appointment for {rest}"
+                return extracted[:120]
+    # "... call them to <purpose>" — recurse on inner clause for nested appointment phrasing
+    call_them = re.search(r"\bcall\s+them\s+to\s+(.+)", m, re.IGNORECASE | re.DOTALL)
+    if call_them:
+        inner = call_them.group(1).strip()
+        nested = _extract_call_reason(inner)
+        if nested:
+            return nested[:120]
+        inner = _strip_phone_numbers(inner)
+        if inner:
+            return inner[:120]
     # Patterns (order matters): prefer full task phrases so we keep "the neutering cost for a cat", not just "a cat"
     delivery_patterns: list[tuple[str, str]] = [
         # Message delivery (prefer explicit wording so we don't misclassify generic "for/about" clauses)
@@ -139,7 +226,7 @@ def _extract_call_reason(msg: str) -> str | None:
         r"(?:inquire|get)\s+(?:about\s+)?(.+)",
         r"check\s+(.+)",  # "check the neutering cost for a cat" -> full phrase (before generic "for")
         r"find\s+out\s+(.+)",
-        r"to\s+((?:return|cancel|reschedule|book|schedule|order|request|report|discuss|dispute|buy|change|update|complain|inquire)\b.+)",
+        r"to\s+((?:return|cancel|reschedule|make|book|schedule|order|request|report|discuss|dispute|buy|change|update|complain|inquire)\b.+)",
         r"(?:can\s+you\s+)?(?:please\s+)?return\s+(.+)",  # e.g. "Can you return the damaged strawberries to 9452644540?"
         r"for\s+(.+)",
         r"about\s+(.+)",
@@ -177,10 +264,34 @@ def _extract_call_reason(msg: str) -> str | None:
                     break
                 extracted = trimmed
             return extracted[:120] if extracted else None
-    return None
+    fb = _fallback_vet_purpose_from_message(m)
+    return fb[:120] if fb else None
 
 
 PURPOSE_MAX_LENGTH = 500
+
+
+def _task_line_from_reason(reason: str) -> str:
+    """One clear sentence for outbound calls; use 'Get …' only when it reads naturally."""
+    r = (reason or "").strip()
+    if not r:
+        return "Veterinary service inquiry"
+    low = r.lower()
+    if low.startswith("tell them:"):
+        return r[0].upper() + r[1:] if len(r) > 1 else r.capitalize()
+    for prefix in (
+        "appointment ",
+        "schedule ",
+        "book ",
+        "make an ",
+        "ask ",
+        "request ",
+        "compare ",
+        "find ",
+    ):
+        if low.startswith(prefix):
+            return r[0].upper() + r[1:] if len(r) > 1 else r.capitalize()
+    return f"Get {r}"
 
 
 def _strip_phone_numbers(text: str) -> str:
@@ -195,8 +306,9 @@ def _strip_phone_numbers(text: str) -> str:
 
 def _build_call_purpose(context: dict[str, Any], profile: dict[str, Any] | None = None) -> str:
     """Build the same purpose string we send to the call backend (max 500 chars)."""
-    reason = (context.get("call_reason") or "").strip() or "Veterinary price inquiry"
-    reason = _strip_phone_numbers(reason) or "Veterinary price inquiry"
+    reason = (context.get("call_reason") or "").strip() or "Veterinary service inquiry"
+    reason = _strip_phone_numbers(reason) or "Veterinary service inquiry"
+    task_line = _task_line_from_reason(reason)
     bits = []
     if context.get("pet_profile_id"):
         if profile is None:
@@ -233,11 +345,11 @@ def _build_call_purpose(context: dict[str, Any], profile: dict[str, Any] | None 
             bits.append(f"age {age}")
         if weight:
             bits.append(f"weight {weight}")
-    # Prefer clear task-first wording: "Get [reason]. Pet: ..." so the purpose is not read as "Get a cat for the pet Buddy"
+    # Prefer clear task-first wording; avoid "Get appointment …" (redundant).
     if bits:
-        purpose = f"Get {reason}. Pet: " + ", ".join(bits)
+        purpose = f"{task_line}. Pet: " + ", ".join(bits)
     else:
-        purpose = f"Get {reason}."
+        purpose = f"{task_line}."
     # Strip any phone numbers that might have appeared in pet bits or elsewhere
     purpose = _strip_phone_numbers(purpose)
     return purpose[:PURPOSE_MAX_LENGTH]
@@ -373,6 +485,11 @@ def transition(
     msg = (message or "").strip()
 
     if state == ConversationState.AWAITING_ZIP:
+        # Preserve the user's stated purpose from the first (or any) message while we collect ZIP.
+        if not (context.get("call_reason") or "").strip():
+            extracted_reason = _extract_call_reason(msg)
+            if extracted_reason:
+                context["call_reason"] = extracted_reason
         zip_val = _normalize_zip(msg)
         phone_val = _normalize_phone(msg)
         if zip_val:
@@ -456,20 +573,27 @@ def transition(
                         "\n".join(lines),
                         candidates,
                     )
-            # No profiles: if hospital_phone, skip availability; else ask availability
+            # Yes, but no saved profiles (anonymous user, empty list, or DB issue): do not loop on the same prompt.
+            if context.get("hospital_phone"):
+                summary = _build_call_summary(context)
+                return (
+                    ConversationState.AWAITING_CALL_CONFIRM,
+                    context,
+                    "Please confirm before I place the call:\n\n" + summary,
+                    None,
+                )
+            return (
+                ConversationState.AWAITING_PET_NAME,
+                context,
+                "No saved pet profiles yet. What's your pet's name?",
+                None,
+            )
         if context.get("hospital_phone"):
             summary = _build_call_summary(context)
-            purpose = _build_call_purpose(context)
             return (
                 ConversationState.AWAITING_CALL_CONFIRM,
                 context,
                 "Please confirm before I place the call:\n\n" + summary,
-                None,
-            )
-            return (
-                ConversationState.AWAITING_AVAILABILITY,
-                context,
-                "When are you available? (e.g. weekends, weekdays after 5pm)",
                 None,
             )
         if _is_no(msg):
@@ -607,7 +731,8 @@ def transition(
                 "Please confirm before I place the call:\n\n" + summary,
                 None,
             )
-        clinics = get_fake_clinics()
+        zip_code = context.get("zip")
+        clinics = resolve_clinics_near_zip(zip_code)
         context["clinic_candidates"] = [c for c in clinics]
         lines = ["Here are some clinics near you:"]
         for i, c in enumerate(clinics, 1):
@@ -626,7 +751,7 @@ def transition(
         indices = parse_clinic_selection(msg, n) if n else None
         if indices is not None:
             selected = [candidates[i - 1] for i in indices]
-            context["selected_clinics"] = selected
+            _apply_selected_clinics_phone(context, selected)
             summary = _build_call_summary(context)
             purpose = _build_call_purpose(context)
             return (
@@ -648,7 +773,7 @@ def transition(
         indices = parse_clinic_selection(msg, n) if n else None
         if indices is not None:
             selected = [candidates[i - 1] for i in indices]
-            context["selected_clinics"] = selected
+            _apply_selected_clinics_phone(context, selected)
             summary = _build_call_summary(context)
             purpose = _build_call_purpose(context)
             return (

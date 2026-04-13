@@ -24,6 +24,9 @@ from app.services.state_machine import (
 STATUS_COLLECTING = "collecting"
 STATUS_READY = "ready"
 
+# Layer 1 may classify vet calls as price_quote or booking; both use the same pet schema.
+_PET_SLOT_CAPABILITIES = frozenset({"price_quote", "booking"})
+
 SLOT_STATE_KEY = "slot_state"
 SLOT_DOMAIN_KEY = "slot_domain"
 SLOT_CAPABILITY_KEY = "slot_capability"
@@ -213,7 +216,7 @@ def _missing_required(
         if s.required and s.name not in filled:
             missing.append(s)
     # Pet price quote: ZIP search vs direct dial — either satisfies "where to target"
-    if domain == "pet" and capability == "price_quote":
+    if domain == "pet" and capability in _PET_SLOT_CAPABILITIES:
         phone_entry = slots.get("phone") or {}
         if phone_entry.get("valid") and phone_entry.get("value"):
             missing = [m for m in missing if m.name != "zip_code"]
@@ -248,16 +251,28 @@ def _export_to_context(domain: str, capability: str, slots: dict[str, dict]) -> 
     ctx: dict[str, Any] = {}
     get_val = lambda n: (slots.get(n) or {}).get("value")
 
-    if domain == "pet" and capability == "price_quote":
+    if domain == "pet" and capability in _PET_SLOT_CAPABILITIES:
         z = get_val("zip_code")
         if z:
             ctx["zip"] = z
         phone = get_val("phone")
         if phone:
             ctx["hospital_phone"] = phone
-        # Prefer full extracted purpose (price, scheduling, etc.) over coarse service_type alone.
+        # Prefer extracted purpose; else synthesize from species + service (not a generic "price inquiry").
+        st_raw = get_val("service_type")
+        pt_raw = (get_val("pet_type") or "").strip().lower()
+        pet_label = "cat" if pt_raw == "cat" else "dog" if pt_raw == "dog" else "pet"
+        synthesized = None
+        if st_raw and not get_val("call_reason"):
+            st = str(st_raw).strip().lower()
+            if st == "neutering":
+                synthesized = (
+                    f"{pet_label} neuter/spay: pricing, availability, and scheduling"
+                )
+            else:
+                synthesized = f"{pet_label} {st}: pricing, availability, and scheduling"
         ctx["call_reason"] = (
-            get_val("call_reason") or get_val("service_type") or "Veterinary price inquiry"
+            get_val("call_reason") or synthesized or "Veterinary service inquiry"
         )
         ctx["name"] = get_val("name")
         ctx["breed"] = get_val("breed")

@@ -66,3 +66,42 @@ def geocode_to_zip(address: str) -> str | None:
                 return digits[:5]
     logger.warning("geocode_to_zip: no postal_code in result for %r", trimmed[:50])
     return None
+
+
+def geocode_to_lat_lng(address: str) -> tuple[float, float] | None:
+    """
+    Geocode a free-text address or US ZIP to (lat, lng) for Places location bias.
+    Same API key and Geocoding endpoint as geocode_to_zip.
+    """
+    if not address or not isinstance(address, str):
+        return None
+    trimmed = address.strip()
+    if not trimmed:
+        return None
+    key = (
+        os.environ.get("GOOGLE_PLACES_API_KEY") or
+        os.environ.get("GOOGLE_MAPS_API_KEY") or
+        ""
+    ).strip()
+    if not key:
+        return None
+    try:
+        params = {"address": trimmed, "key": key, "region": "us"}
+        url = "https://maps.googleapis.com/maps/api/geocode/json?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        logger.warning("geocode_to_lat_lng: request failed for %r: %s", trimmed[:50], e)
+        return None
+    if data.get("status") != "OK":
+        return None
+    results = data.get("results")
+    if not results:
+        return None
+    loc = results[0].get("geometry", {}).get("location")
+    if not loc:
+        return None
+    lat, lng = loc.get("lat"), loc.get("lng")
+    if lat is None or lng is None:
+        return None
+    return (float(lat), float(lng))
