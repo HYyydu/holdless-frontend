@@ -21,8 +21,8 @@ export interface ChatResponse {
 export interface GetChatResponseOptions {
   /** JWT from call-backend sign-in. Sent as Authorization: Bearer. Required for placing calls when backend uses per-user auth. */
   callBackendToken?: string | null;
-  /** User's profile name (from Profile tab). Sent so the AI can suggest it when asking for the call name; user can override by typing a different name. */
-  profileName?: string | null;
+  /** User's first name from Profile tab. Sent so call flows can default to caller first name. */
+  profileFirstName?: string | null;
 }
 
 /**
@@ -41,13 +41,13 @@ export async function getChatResponse(
   const body: {
     messages: ChatMessage[];
     callBackendToken?: string;
-    profileName?: string;
+    profileFirstName?: string;
   } = {
     messages,
   };
   if (token) body.callBackendToken = token;
-  const profileName = options?.profileName?.trim();
-  if (profileName) body.profileName = profileName;
+  const profileFirstName = options?.profileFirstName?.trim();
+  if (profileFirstName) body.profileFirstName = profileFirstName;
 
   try {
     const res = await fetch("/api/chat", {
@@ -79,6 +79,8 @@ export interface CallStatus {
   /** Cumulative Realtime usage when call backend persists them (GET /api/calls/:id). */
   input_tokens?: number;
   output_tokens?: number;
+  /** Set when the user was bridged in via conference join (POST /api/calls/:id/join). */
+  user_joined_at?: string | null;
 }
 
 export interface GetCallStatusOptions {
@@ -230,6 +232,46 @@ export async function getCallStatus(
 ): Promise<CallStatus | null> {
   const r = await getCallStatusWithMeta(callId, options);
   return r.ok ? r.data : null;
+}
+
+export type JoinCallResult =
+  | { ok: true }
+  | { ok: false; status: number; message: string };
+
+/**
+ * POST /api/calls/:callId/join — call backend dials the user's phone into the same conference.
+ * Body: { to_phone: E.164 }.
+ */
+export async function joinCallConference(
+  callId: string,
+  toPhoneE164: string,
+  options?: GetCallStatusOptions,
+): Promise<JoinCallResult> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const token = options?.callBackendToken?.trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  try {
+    const res = await fetch(`/api/calls/${encodeURIComponent(callId)}/join`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ to_phone: toPhoneE164 }),
+    });
+    if (res.ok) return { ok: true };
+    const data = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      message?: string;
+    };
+    const message =
+      (data.error as string) ||
+      (data.message as string) ||
+      `Request failed (${res.status})`;
+    return { ok: false, status: res.status, message };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "Network error";
+    return { ok: false, status: 0, message };
+  }
 }
 
 export interface SummarizeCallOptions extends GetCallStatusOptions {
@@ -526,13 +568,27 @@ export async function sendChatMessage(
   userId: string,
   message: string,
   conversationId?: string | null,
-  options?: { callBackendToken?: string | null },
+  options?: {
+    callBackendToken?: string | null;
+    attachments?: ChatAttachmentPayload[];
+    personalProfile?: ChatPersonalProfilePayload;
+  },
 ): Promise<{
   reply_text: string;
   conversation_id: string;
   debug_state: string;
   ui_options?: unknown[];
+  task_id?: string;
+  callId?: string;
+  callReason?: string;
+  domain?: string;
+  queued_calls?: {
+    callId: string;
+    phone?: string;
+    name?: string;
+  }[];
   free_trial_remaining?: number;
+  request_quota_remaining?: number;
   error?: string;
   code?: string;
 } | null> {
@@ -544,6 +600,12 @@ export async function sendChatMessage(
   const token = options?.callBackendToken?.trim();
   if (token) {
     body.callBackendToken = token;
+  }
+  if (Array.isArray(options?.attachments) && options.attachments.length > 0) {
+    body.attachments = options.attachments;
+  }
+  if (options?.personalProfile && typeof options.personalProfile === "object") {
+    body.personal_profile = options.personalProfile;
   }
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -570,6 +632,31 @@ export async function sendChatMessage(
         debug_state: (data as { debug_state?: string }).debug_state,
       });
     if (!res.ok) {
+      const detail =
+        data && typeof data === "object" && "detail" in data
+          ? (data as { detail?: unknown }).detail
+          : undefined;
+      const detailObj =
+        detail && typeof detail === "object"
+          ? (detail as {
+              error?: string;
+              code?: string;
+              request_quota_remaining?: number;
+            })
+          : undefined;
+      if (res.status === 403 && detailObj?.code === "quota_exceeded") {
+        return {
+          reply_text:
+            detailObj.error ??
+            "You have no request quota remaining. Please increase your quota.",
+          conversation_id: conversationId || "",
+          debug_state: "QUOTA_EXCEEDED",
+          free_trial_remaining: detailObj.request_quota_remaining,
+          request_quota_remaining: detailObj.request_quota_remaining,
+          error: detailObj.error,
+          code: detailObj.code,
+        };
+      }
       if (DEBUG_CHAT)
         console.warn("[History] sendChatMessage not ok", res.status, data);
       if (import.meta.env.DEV)
@@ -590,7 +677,13 @@ export async function sendChatMessage(
       callReason?: string;
       /** Intent domain (e.g. pet_services) - set by Node when call is placed */
       domain?: string;
+      queued_calls?: {
+        callId: string;
+        phone?: string;
+        name?: string;
+      }[];
       free_trial_remaining?: number;
+      request_quota_remaining?: number;
       error?: string;
       code?: string;
     };
@@ -616,6 +709,39 @@ export interface TaskRowFromApi {
   slots?: Record<string, unknown>;
 }
 
+export interface ExtractedBillFields {
+  companyProviderName?: string;
+  billAmount?: string;
+  accountOrInvoiceNumber?: string;
+  billDueDate?: string;
+  chargeOrServiceDate?: string;
+  billingPhoneNumber?: string;
+}
+
+export interface ChatAttachmentPayload {
+  path: string;
+  fileName: string;
+  contentType: string;
+  sizeBytes: number;
+  uploadedAt: string;
+  extractedFields?: ExtractedBillFields | null;
+}
+
+export interface ChatPersonalProfilePayload {
+  firstName?: string;
+  lastName?: string;
+  name?: string;
+  email?: string;
+  phone?: string;
+  address?: string;
+  dateOfBirth?: string;
+  state?: string;
+  zipCode?: string;
+  tone?: string;
+  language?: string;
+  timeZone?: string;
+}
+
 /**
  * List tasks for a user (Python backend → Supabase).
  */
@@ -629,6 +755,31 @@ export async function getTasks(userId: string): Promise<TaskRowFromApi[]> {
   } catch (e) {
     console.warn("getTasks failed", e);
     return [];
+  }
+}
+
+export interface UserRequestQuota {
+  user_id: string;
+  request_quota_total: number;
+  request_quota_used: number;
+  request_quota_remaining: number;
+}
+
+/** Fetch per-user request quota from backend. */
+export async function getUserRequestQuota(
+  userId: string,
+): Promise<UserRequestQuota | null> {
+  try {
+    const res = await fetch(
+      `/api/users/${encodeURIComponent(userId)}/request-quota`,
+    );
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (!data || typeof data !== "object") return null;
+    return data as UserRequestQuota;
+  } catch (e) {
+    console.warn("getUserRequestQuota failed", e);
+    return null;
   }
 }
 
@@ -654,6 +805,31 @@ export async function createTask(
     return row as TaskRowFromApi;
   } catch (e) {
     console.warn("createTask failed", e);
+    return null;
+  }
+}
+
+/** Extract bill fields from uploaded attachment metadata via backend OCR/LLM. */
+export async function extractBillFields(
+  userId: string,
+  attachments: Array<Record<string, unknown>>,
+): Promise<ExtractedBillFields | null> {
+  try {
+    const res = await fetch("/api/tasks/extract-bill-fields", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: userId,
+        attachments,
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => ({}));
+    const fields = data?.fields;
+    if (!fields || typeof fields !== "object") return null;
+    return fields as ExtractedBillFields;
+  } catch (e) {
+    console.warn("extractBillFields failed", e);
     return null;
   }
 }

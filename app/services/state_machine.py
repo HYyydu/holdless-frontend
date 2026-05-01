@@ -141,7 +141,7 @@ def _extract_call_reason(msg: str) -> str | None:
     - information gathering: "call X to ask/check/find out ..."
     - message delivery: "call X and tell them/let them know/inform/share ..."
     """
-    m = (msg or "").strip()
+    m = re.sub(r"\s+", " ", (msg or "").strip())
     if not m:
         return None
     # Strip leading "dial X and" / "call X and" so we match the intent clause (e.g. "check the neutering cost for a cat")
@@ -171,6 +171,26 @@ def _extract_call_reason(msg: str) -> str | None:
             extracted = _strip_phone_numbers(extracted)
             if extracted:
                 return extracted[:120]
+    # Insurance-specific intent: keep the concrete disputed adjustment in the purpose.
+    insurance_adjustment = re.search(
+        r"\b(insurance\s+adjustment(?:\s+of)?\s+\$?\d[\d,]*(?:\.\d{2})?)\b",
+        m,
+        re.IGNORECASE,
+    )
+    if insurance_adjustment:
+        detail = insurance_adjustment.group(1).strip()
+        return f"Ask about the {detail}"[:120]
+    # Intent-first phrasing ("I want to understand/confirm/clarify ...") should win over generic "for ...".
+    intent_match = re.search(
+        r"\b(?:i\s+)?(?:want|need|would\s+like)\s+to\s+"
+        r"(?:understand|know|confirm|clarify|verify|check|find\s+out)\s+(.+)",
+        m,
+        re.IGNORECASE,
+    )
+    if intent_match:
+        extracted = _strip_phone_numbers(intent_match.group(1).strip())
+        if extracted:
+            return f"Ask whether {extracted}"[:120]
     # Scheduling / appointment phrasing (before generic "for/about" and before "call them" as delivery)
     appointment_first = [
         r"(?:make|book|schedule)\s+an?\s+appointment(?:\s+for|\s+in\s+getting|\s+to\s+get)?\s+(.+)",
@@ -228,8 +248,6 @@ def _extract_call_reason(msg: str) -> str | None:
         r"find\s+out\s+(.+)",
         r"to\s+((?:return|cancel|reschedule|make|book|schedule|order|request|report|discuss|dispute|buy|change|update|complain|inquire)\b.+)",
         r"(?:can\s+you\s+)?(?:please\s+)?return\s+(.+)",  # e.g. "Can you return the damaged strawberries to 9452644540?"
-        r"for\s+(.+)",
-        r"about\s+(.+)",
     ]
     for pat, prefix in delivery_patterns:
         match = re.search(pat, m, re.IGNORECASE)
@@ -264,6 +282,13 @@ def _extract_call_reason(msg: str) -> str | None:
                     break
                 extracted = trimmed
             return extracted[:120] if extracted else None
+    # Last resort: allow broad "for/about" only when this is clearly a call directive.
+    if re.search(r"\b(?:call|dial|phone|ask|check|find\s+out)\b", m, re.IGNORECASE):
+        fallback_match = re.search(r"\b(?:for|about)\s+(.+)", m, re.IGNORECASE)
+        if fallback_match:
+            extracted = _strip_phone_numbers(fallback_match.group(1).strip())
+            if extracted:
+                return extracted[:120]
     fb = _fallback_vet_purpose_from_message(m)
     return fb[:120] if fb else None
 
@@ -397,7 +422,7 @@ def _build_call_summary(context: dict[str, Any]) -> str:
         profile = get_pet_profile(context["pet_profile_id"])
     purpose = _build_call_purpose(context, profile)
     context["call_reason"] = purpose
-    parts = [f"Description: {purpose}", ""]
+    parts = [f"Purpose: {purpose}", ""]
     # Location
     if context.get("zip"):
         parts.append(f"• Location: ZIP {context['zip']}")
@@ -435,8 +460,12 @@ def _build_call_summary(context: dict[str, Any]) -> str:
     # Who we'll call
     selected = context.get("selected_clinics") or []
     if selected:
-        names = ", ".join(c.get("name", "?") for c in selected)
-        parts.append(f"• I will call: {names}")
+        items = []
+        for c in selected:
+            nm = c.get("name", "?")
+            ph = (c.get("phone") or "").strip()
+            items.append(f"{nm} ({ph})" if ph else str(nm))
+        parts.append("• I will call: " + ", ".join(items))
     elif context.get("hospital_phone"):
         parts.append(f"• I will call: the hospital at {context['hospital_phone']}")
     if len(parts) <= 2:  # only Description and blank line

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from app.core.slot_registry.insurance import INSURANCE_BILL_DISPUTE
 from app.core.slot_registry.pet import PET_PRICE_QUOTE
 from app.core.slot_registry.retail import RETURN_SERVICE
 
@@ -18,6 +19,7 @@ class SlotRegistry:
         # Same slots: booking vs quote both need ZIP, service, pet details, and call purpose.
         ("pet", "booking"): PET_PRICE_QUOTE,
         ("retail", "complaint"): RETURN_SERVICE,
+        ("insurance", "complaint"): INSURANCE_BILL_DISPUTE,
     }
 
     @classmethod

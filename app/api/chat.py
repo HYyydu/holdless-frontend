@@ -1,14 +1,18 @@
 """POST /chat: deterministic state machine chat endpoint."""
 from __future__ import annotations
 
+import json
 import re
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.services.conversation_persistence import (
+    consume_user_request_quota,
     create_conversation,
     ensure_user,
+    get_user_request_quota,
+    get_user_request_quota_remaining,
     update_conversation,
     append_messages,
     list_conversations,
@@ -48,11 +52,13 @@ from app.services.return_service_machine import (
 )
 from app.services.state_machine import (
     ConversationState,
+    _build_call_summary,
     is_positive_confirmation,
     transition as hospital_transition,
 )
 from app.services.state_machine import _is_yes, _normalize_phone
 from app.services.call_placement import (
+    build_call_backend_payload,
     call_backend_configured,
     place_outbound_call,
     resolve_bearer_token,
@@ -65,12 +71,542 @@ _DIRECT_CALL_VERB_RE = re.compile(
     r"\b(call|dial|phone|ring)\b|给.*打电话|拨打",
     re.IGNORECASE,
 )
+_PARKING_QUEUE_PAYLOAD_RE = re.compile(r"^\[\[PARKING_QUEUE\]\]\s*(\{.*\})\s*$", re.DOTALL)
+_PLACE_SEARCH_RE = re.compile(
+    # Explicit search verbs + place nouns
+    r"(search|find|look\s*for|查|搜索|找|寻找).*(place|places|location|locations|店|地点|商家|医院|诊所|停车|车位|parking|clinic|hospital|vet|veterinar)"
+    r"|"
+    r"(place|places|location|locations|店|地点|商家|医院|诊所|停车|车位|parking|clinic|hospital|vet|veterinar).*(search|find|look\s*for|查|搜索|找|寻找)"
+    r"|"
+    # Nearby phrasing + supported categories (parking / vet)
+    r"(nearby|near me|附近|周边|附近的|周围).*(parking|车位|停车|车场|garage|lot|clinic|hospital|vet|veterinar|宠物医院|宠物诊所|动物医院)"
+    r"|"
+    r"(parking|车位|停车|车场|garage|lot|clinic|hospital|vet|veterinar|宠物医院|宠物诊所|动物医院).*(nearby|near me|附近|周边|附近的|周围)",
+    re.IGNORECASE,
+)
+_PARKING_HINT_RE = re.compile(r"(parking|车位|停车|车场|garage|lot)", re.IGNORECASE)
+# Pet / veterinary (check before generic 医院 so 宠物医院 maps here).
+_PET_VET_HINT_RE = re.compile(
+    r"(vet|veterinar|veterinary|宠物|兽医|宠物医院|宠物诊所|动物医院|pet\s+hospital|animal\s+hospital)",
+    re.IGNORECASE,
+)
+# Human hospital / ER / walk-in (includes Chinese 医院; English hospital when spelled in Latin).
+_HUMAN_MEDICAL_HINT_RE = re.compile(
+    r"(医院|急诊|诊所|urgent\s*care|emergency(\s+room)?|\bhospital\b|walk\s*-?\s*in|walkin)",
+    re.IGNORECASE,
+)
+_HAS_LOCATION_HINT_RE = re.compile(
+    # ZIP / ZIP+4 (avoid \b so numbers next to CJK chars like "...吗90024" still match)
+    r"(?<!\d)\d{5}(?:-\d{4})?(?!\d)"
+    r"|"
+    r"\d+\s+[A-Za-z0-9][A-Za-z0-9\s\.\-]{2,}"  # rough street number + text
+    r"|"
+    r"(los angeles|new york|san francisco|beijing|shanghai|seattle|austin)"
+    r"|"
+    r"(地址|city|area|district|zip|zipcode|postal)",
+    re.IGNORECASE,
+)
+_ZIP_RE = re.compile(r"(?<!\d)(\d{5}(?:-\d{4})?)(?!\d)")
+_INSURANCE_SEARCH_RE = re.compile(
+    r"(insurance|health\s*insurance|medical\s*insurance|医保|保险)"
+    r".*(search|find|look\s*for|best|top|compare|推荐|搜索|找|对比)"
+    r"|"
+    r"(search|find|look\s*for|best|top|compare|推荐|搜索|找|对比)"
+    r".*(insurance|health\s*insurance|medical\s*insurance|医保|保险)",
+    re.IGNORECASE,
+)
+_BILL_DISPUTE_RE = re.compile(
+    r"(dispute\s+(?:my\s+)?bill|billing\s+issue|bill(?:ing)?\s+problem|账单|争议账单|账单纠纷)",
+    re.IGNORECASE,
+)
+_CAL_BOOKING_INTENT_RE = re.compile(
+    r"(book\s+(a\s+)?care|schedule\s+an?\s+appointment|book\s+an?\s+appointment|预约|安排预约)",
+    re.IGNORECASE,
+)
+_CAL_BOOKING_PAYLOAD_RE = re.compile(r"^\[\[CAL_BOOKING\]\]\s*(\{.*\})\s*$", re.DOTALL)
+
+
+def _needs_location_for_nearby_search(message: str) -> bool:
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    if not _PLACE_SEARCH_RE.search(msg):
+        return False
+    # Nearby search intent exists but no clear location anchor in the text.
+    return _HAS_LOCATION_HINT_RE.search(msg) is None
+
+
+def _location_clarify_reply() -> str:
+    return (
+        "I can search nearby parking, vet clinics, or hospitals / urgent care. "
+        "Please tell me the city, area, or a specific address so I can search the right location."
+    )
+
+
+def _parse_parking_queue_payload(message: str) -> dict | None:
+    msg = (message or "").strip()
+    m = _PARKING_QUEUE_PAYLOAD_RE.match(msg)
+    if not m:
+        return None
+    try:
+        payload = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    places_raw = payload.get("places")
+    if not isinstance(places_raw, list):
+        return None
+    places: list[dict] = []
+    for p in places_raw:
+        if not isinstance(p, dict):
+            continue
+        phone = str(p.get("phone") or "").strip()
+        name = str(p.get("name") or "Parking").strip()
+        if not phone:
+            continue
+        places.append(
+            {
+                "name": name or "Parking",
+                "phone": phone,
+                "address": str(p.get("address") or "").strip(),
+            }
+        )
+    if not places:
+        return None
+    reason = str(payload.get("call_reason") or "").strip()
+    if not reason:
+        reason = (
+            "Ask monthly parking availability, monthly price, and contract/deposit requirements"
+        )
+    flow_tag = str(payload.get("flow_tag") or "").strip().lower()
+    return {"places": places, "call_reason": reason, "flow_tag": flow_tag}
+
+
+def _extract_location_query(message: str) -> str | None:
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    m = _ZIP_RE.search(msg)
+    if m:
+        return m.group(1)
+    # Fallback: pass the full user text when we cannot isolate a clean location token.
+    return msg
+
+
+def _parking_search_reply(message: str) -> tuple[str, list[dict] | None] | None:
+    location_query = _extract_location_query(message)
+    if not location_query:
+        return None
+    try:
+        from app.services.places_search import search_parking_places
+        places = search_parking_places(location_query, limit=5)
+    except Exception:
+        return None
+    if not places:
+        return (
+            f"I couldn't find parking results for {location_query} right now. "
+            "Please share a nearby landmark or full address and I can try again.",
+            None,
+        )
+    lines = [f"I found monthly parking options near {location_query}:"]
+    lines.append("")
+    ui_options: list[dict] = []
+    for i, p in enumerate(places, 1):
+        name = p.get("name") or "Parking"
+        addr = p.get("address") or "Address not available"
+        phone = p.get("phone") or "N/A"
+        rating = p.get("rating")
+        rating_text = str(rating) if rating is not None else "N/A"
+        open_now = p.get("open_now")
+        open_text = "24h/Open now" if open_now is True else "Closed/Unknown"
+        lines.append(f"{i}. {name}")
+        lines.append(f"   Phone: {phone}")
+        lines.append(f"   Address: {addr}")
+        lines.append(f"   Rating: {rating_text} | Hours: {open_text}")
+        lines.append("   Note: Can ask about monthly availability")
+        lines.append("")
+        ui_options.append(
+            {
+                "type": "parking_place",
+                "index": i,
+                "name": name,
+                "phone": phone if phone != "N/A" else "",
+                "address": addr,
+                "rating": rating,
+                "open_now": open_now,
+                "location_query": location_query,
+            }
+        )
+    lines.append("Tap a card below and I can call to ask monthly availability and price.")
+    return "\n".join(lines), ui_options
+
+
+def _vet_search_reply(message: str) -> tuple[str, list[dict] | None] | None:
+    zip_match = _ZIP_RE.search((message or "").strip())
+    if not zip_match:
+        return (
+            "I can search nearby vet clinics, but I need a ZIP code first (for example, 90024).",
+            None,
+        )
+    zip_code = zip_match.group(1)
+    try:
+        from app.services.places_search import resolve_clinics_near_zip
+        clinics = resolve_clinics_near_zip(zip_code)
+    except Exception:
+        return None
+    if not clinics:
+        return (
+            f"I couldn't find veterinary clinics near {zip_code} right now. "
+            "Please share a nearby landmark or full address and I can try again.",
+            None,
+        )
+    lines = [f"I found nearby veterinary clinics around {zip_code}:", ""]
+    ui_options: list[dict] = []
+    for i, c in enumerate(clinics[:5], 1):
+        name = c.get("name") or "Veterinary clinic"
+        phone = c.get("phone") or "N/A"
+        address = c.get("address") or "Address not available"
+        rating = c.get("rating")
+        rating_text = str(rating) if rating is not None else "N/A"
+        distance = c.get("distance")
+        dist_text = f"{distance} mi" if distance is not None else "distance unavailable"
+        lines.append(f"{i}. {name}")
+        lines.append(f"   Phone: {phone}")
+        lines.append(f"   Address: {address}")
+        lines.append(f"   Rating: {rating_text} | Distance: {dist_text}")
+        lines.append("")
+        ui_options.append(
+            {
+                # Reuse existing selectable-card UI path in frontend.
+                "type": "parking_place",
+                "index": i,
+                "name": name,
+                "phone": phone if phone != "N/A" else "",
+                "address": address,
+                "rating": rating,
+                "open_now": None,
+                "location_query": zip_code,
+                "note": "Can ask vet pricing and appointment availability",
+                "call_reason": "Ask about veterinary service pricing and appointment availability",
+            }
+        )
+    lines.append("If you want, I can call one of these clinics and ask for details.")
+    return "\n".join(lines), ui_options
+
+
+def _human_medical_search_reply(message: str) -> tuple[str, list[dict] | None] | None:
+    zip_match = _ZIP_RE.search((message or "").strip())
+    if not zip_match:
+        return (
+            "I can search hospitals and urgent care near you, but I need a ZIP code first "
+            "(for example, 90024).",
+            None,
+        )
+    zip_code = zip_match.group(1)
+    try:
+        from app.services.places_search import search_human_medical_near_zip
+
+        places = search_human_medical_near_zip(zip_code)
+    except Exception:
+        return None
+    if not places:
+        return (
+            f"I couldn't find hospitals or urgent care near {zip_code} right now. "
+            "Try a nearby landmark or full address and I can search again.",
+            None,
+        )
+    walk_in = bool(
+        re.search(r"walk\s*-?\s*in|walkin|急诊", message or "", re.IGNORECASE)
+    )
+    call_reason = (
+        "Ask whether walk-in visits are accepted, current wait or triage process, and what to bring"
+        if walk_in
+        else "Ask about services, phone registration, and walk-in or same-day appointment availability"
+    )
+    lines = [f"I found hospitals / urgent care options around {zip_code}:", ""]
+    ui_options: list[dict] = []
+    for i, c in enumerate(places[:5], 1):
+        name = c.get("name") or "Hospital"
+        phone = c.get("phone") or "N/A"
+        address = c.get("address") or "Address not available"
+        rating = c.get("rating")
+        rating_text = str(rating) if rating is not None else "N/A"
+        distance = c.get("distance")
+        dist_text = f"{distance} mi" if distance is not None else "distance unavailable"
+        lines.append(f"{i}. {name}")
+        lines.append(f"   Phone: {phone}")
+        lines.append(f"   Address: {address}")
+        lines.append(f"   Rating: {rating_text} | Distance: {dist_text}")
+        lines.append("")
+        ui_options.append(
+            {
+                "type": "parking_place",
+                "index": i,
+                "name": name,
+                "phone": phone if phone != "N/A" else "",
+                "address": address,
+                "rating": rating,
+                "open_now": None,
+                "location_query": zip_code,
+                "note": "Can ask walk-in / ER intake and wait times",
+                "call_reason": call_reason,
+            }
+        )
+    lines.append("Tap a card below if you want me to call and ask about walk-in or availability.")
+    return "\n".join(lines), ui_options
+
+
+def _place_search_reply(message: str) -> tuple[str, list[dict] | None] | None:
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    # Category routing: parking → pet vet → human hospital/urgent care. Never default to parking.
+    if _PARKING_HINT_RE.search(msg):
+        return _parking_search_reply(msg)
+    if _PET_VET_HINT_RE.search(msg):
+        return _vet_search_reply(msg)
+    if _HUMAN_MEDICAL_HINT_RE.search(msg):
+        return _human_medical_search_reply(msg)
+    return (
+        "I can search nearby parking, veterinary clinics, or hospitals / urgent care. "
+        "Say which you need and include an area or ZIP—for example: monthly parking near 90024, "
+        "vet clinic near 90024, or hospital / walk-in near 90024.",
+        None,
+    )
+
+
+def _insurance_search_reply(message: str) -> tuple[str, list[dict] | None] | None:
+    msg = (message or "").strip()
+    if not msg:
+        return None
+    try:
+        from app.services.insurance_search import (
+            search_health_insurance_companies,
+            summarize_health_insurance_results,
+        )
+
+        companies = search_health_insurance_companies(msg, limit=5)
+    except Exception:
+        return None
+    if not companies:
+        return (
+            "I couldn't find reliable insurance company phone results right now. "
+            "Try adding a state/ZIP and I can search again (for example: best health insurance in CA 90024).",
+            None,
+        )
+    reply_text = summarize_health_insurance_results(companies, location_hint=msg)
+    ui_options: list[dict] = []
+    for i, c in enumerate(companies, 1):
+        ui_options.append(
+            {
+                # Reuse existing selectable-card flow in frontend.
+                "type": "parking_place",
+                "index": i,
+                "name": c.get("name") or "Insurance company",
+                "phone": c.get("phone") or "",
+                "address": "",
+                "rating": None,
+                "open_now": None,
+                "location_query": msg,
+                "note": "Can ask about plan options, monthly premium, deductible, and network",
+                "call_reason": "Ask about health insurance plan options, premium, deductible, network, and enrollment timing",
+                "flow_tag": "insurance_search",
+                "source_url": c.get("source_url"),
+            }
+        )
+    return reply_text, ui_options
+
+
+def _parse_cal_booking_payload(message: str) -> dict | None:
+    msg = (message or "").strip()
+    m = _CAL_BOOKING_PAYLOAD_RE.match(msg)
+    if not m:
+        return None
+    try:
+        payload = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    slot_start_at = str(payload.get("slot_start_at") or "").strip()
+    timezone = str(payload.get("timezone") or "").strip()
+    if not slot_start_at or not timezone:
+        return None
+    booking_url = str(payload.get("booking_url") or "").strip()
+    return {
+        "slot_start_at": slot_start_at,
+        "timezone": timezone,
+        "booking_url": booking_url,
+    }
+
+
+_TIMEZONE_ALIAS_MAP = {
+    "pt": "America/Los_Angeles",
+    "pst": "America/Los_Angeles",
+    "pdt": "America/Los_Angeles",
+    "mt": "America/Denver",
+    "mst": "America/Denver",
+    "mdt": "America/Denver",
+    "ct": "America/Chicago",
+    "cst": "America/Chicago",
+    "cdt": "America/Chicago",
+    "et": "America/New_York",
+    "est": "America/New_York",
+    "edt": "America/New_York",
+    "utc": "UTC",
+    "gmt": "UTC",
+    "tokyo": "Asia/Tokyo",
+    "japan": "Asia/Tokyo",
+    "beijing": "Asia/Shanghai",
+    "shanghai": "Asia/Shanghai",
+    "hong kong": "Asia/Hong_Kong",
+    "singapore": "Asia/Singapore",
+    "london": "Europe/London",
+    "paris": "Europe/Paris",
+    "berlin": "Europe/Berlin",
+    "sydney": "Australia/Sydney",
+}
+
+
+def _resolve_timezones(message: str, personal_profile: dict | None) -> list[str]:
+    msg = (message or "").strip()
+    zones: list[str] = []
+    iana_matches = re.findall(r"\b([A-Za-z]+/[A-Za-z_]+(?:/[A-Za-z_]+)?)\b", msg)
+    for z in iana_matches:
+        if z not in zones:
+            zones.append(z)
+    low_msg = msg.lower()
+    for token, zone in _TIMEZONE_ALIAS_MAP.items():
+        if token in low_msg and zone not in zones:
+            zones.append(zone)
+    if isinstance(personal_profile, dict):
+        profile_tz = str(
+            personal_profile.get("timeZone")
+            or personal_profile.get("timezone")
+            or ""
+        ).strip()
+        if profile_tz and profile_tz not in zones:
+            zones.insert(0, profile_tz)
+    if not zones:
+        zones.append("UTC")
+    return zones[:3]
+
+
+def _cal_booking_reply(message: str, personal_profile: dict | None) -> tuple[str, list[dict] | None] | None:
+    timezones = _resolve_timezones(message, personal_profile)
+    try:
+        from app.services.calcom import calcom_env_configured, list_slots_and_booking_url
+
+        grouped: list[tuple[str, list[dict], str | None, str | None]] = []
+        for tz in timezones:
+            slots, booking_url, fetch_err = list_slots_and_booking_url(timezone=tz, limit=4)
+            grouped.append((tz, slots, booking_url, fetch_err))
+    except Exception:
+        grouped = [(timezones[0], [], None, None)]
+    all_slots = sum((len(slots) for _, slots, _, _ in grouped), 0)
+    if all_slots == 0:
+        timezone = timezones[0]
+        booking_url = grouped[0][2]
+        fetch_err = grouped[0][3]
+        lines = [
+            "I can help schedule this appointment.",
+            f"I'll use timezone: {timezone}.",
+            "Please pick a time directly in Cal.com:",
+        ]
+        if booking_url:
+            lines.append(booking_url)
+        elif not calcom_env_configured():
+            lines.append(
+                "Cal.com is not configured yet. Set CAL_COM_API_KEY and CAL_COM_EVENT_TYPE_ID in `.env` "
+                "at the project root, then restart the Python backend so it reloads env (e.g. restart `npm run server`)."
+            )
+        else:
+            detail = (fetch_err or "").strip()
+            lines.append(
+                "Could not load time slots from Cal.com. "
+                "Confirm CAL_COM_EVENT_TYPE_ID is the numeric event type ID, API key is valid, "
+                "and restart the backend after editing `.env`."
+            )
+            if detail:
+                lines.append(f"Cal.com response: {detail[:240]}")
+        return "\n".join(lines), None
+    ui_options: list[dict] = []
+    idx = 1
+    primary_booking_url = grouped[0][2] or ""
+    for timezone, slots, booking_url, _ in grouped:
+        if booking_url and not primary_booking_url:
+            primary_booking_url = booking_url
+        for slot in slots:
+            ui_options.append(
+                {
+                    "type": "cal_slot",
+                    "index": idx,
+                    "label": str(slot.get("label") or f"Option {idx}") + f" [{timezone}]",
+                    "slot_start_at": str(slot.get("start_at") or ""),
+                    "timezone": timezone,
+                    "booking_url": booking_url or "",
+                }
+            )
+            idx += 1
+    lines = [
+        f"I found appointment times in: {', '.join(timezones)}.",
+        "Select one slot below and I will use it when placing the call.",
+    ]
+    if primary_booking_url:
+        lines.append(f"If you prefer, you can also book directly here: {primary_booking_url}")
+    lines.append("Tip: you can ask for multiple zones, e.g. 'show slots in America/New_York and Asia/Tokyo'.")
+    return "\n".join(lines), ui_options
 
 
 class ChatRequest(BaseModel):
     user_id: str
     message: str = ""
     conversation_id: str | None = None
+    attachments: list[dict] | None = None
+    personal_profile: dict | None = None
+
+
+def _summarize_attachment_fields(fields: dict) -> str:
+    if not isinstance(fields, dict):
+        return ""
+    key_map = {
+        "companyProviderName": "provider",
+        "billAmount": "bill amount",
+        "accountOrInvoiceNumber": "account/invoice",
+        "billDueDate": "due date",
+        "chargeOrServiceDate": "service date",
+        "billingPhoneNumber": "billing phone",
+    }
+    parts: list[str] = []
+    for key, label in key_map.items():
+        value = str(fields.get(key) or "").strip()
+        if value:
+            parts.append(f"{label}: {value}")
+    return "; ".join(parts)
+
+
+def _build_attachment_context(attachments: list[dict] | None) -> tuple[str, str | None]:
+    if not isinstance(attachments, list) or not attachments:
+        return "", None
+    lines = ["Uploaded attachments:"]
+    billing_phone = None
+    for idx, item in enumerate(attachments, 1):
+        if not isinstance(item, dict):
+            continue
+        file_name = str(item.get("fileName") or item.get("file_name") or f"file-{idx}").strip()
+        content_type = str(item.get("contentType") or item.get("content_type") or "").strip()
+        extracted = item.get("extractedFields")
+        if file_name:
+            lines.append(f"- {file_name} ({content_type or 'unknown type'})")
+        field_summary = _summarize_attachment_fields(extracted if isinstance(extracted, dict) else {})
+        if field_summary:
+            lines.append(f"  extracted: {field_summary}")
+        if billing_phone is None and isinstance(extracted, dict):
+            candidate = str(extracted.get("billingPhoneNumber") or "").strip()
+            if candidate:
+                billing_phone = candidate
+    return ("\n".join(lines) if len(lines) > 1 else ""), billing_phone
 
 
 def _context_for_redis(context: dict) -> dict:
@@ -87,6 +623,7 @@ def _context_for_redis(context: dict) -> dict:
         "hospital_phone": context.get("hospital_phone"),
         "phone": context.get("phone"),
         "call_reason": context.get("call_reason"),
+        "call_details": context.get("call_details"),
         "pet_profile_id": context.get("pet_profile_id"),
         "pet_profile_name": context.get("pet_profile_name"),
         "pet_profile_candidates": context.get("pet_profile_candidates") or [],
@@ -97,8 +634,26 @@ def _context_for_redis(context: dict) -> dict:
         "availability": context.get("availability"),
         "clinic_candidates": context.get("clinic_candidates") or [],
         "selected_clinics": context.get("selected_clinics") or [],
+        "insurance_precall_required": context.get("insurance_precall_required"),
+        "insurance_call_profile": context.get("insurance_call_profile") or {},
+        "insurance_profile_prefill_candidate": context.get("insurance_profile_prefill_candidate") or {},
+        "insurance_profile_prefill_decided": context.get("insurance_profile_prefill_decided"),
+        "personal_profile": context.get("personal_profile") or {},
         "reply_locale": context.get("reply_locale"),
+        "booking_timezone": context.get("booking_timezone"),
+        "booking_start_at": context.get("booking_start_at"),
     }
+
+def _resolve_profile_first_name(personal_profile: dict | None) -> str:
+    if not isinstance(personal_profile, dict):
+        return ""
+    explicit = str(personal_profile.get("firstName") or "").strip()
+    if explicit:
+        return explicit
+    full_name = str(personal_profile.get("name") or "").strip()
+    if not full_name:
+        return ""
+    return full_name.split()[0]
 
 
 def _show_clinic_selection(context: dict) -> tuple[dict, str, list]:
@@ -138,9 +693,33 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     """
     user_id = body.user_id
     message = body.message or ""
+    raw_message = message
+    attachment_context, extracted_billing_phone = _build_attachment_context(body.attachments)
+    if attachment_context:
+        message = f"{raw_message.strip()}\n\n{attachment_context}".strip()
     conversation_id = body.conversation_id if body.conversation_id else None
+    personal_profile = body.personal_profile if isinstance(body.personal_profile, dict) else None
 
     ensure_user(user_id)
+    try:
+        request_quota_remaining = consume_user_request_quota(user_id)
+    except ValueError as e:
+        if str(e) == "quota_exceeded":
+            remaining = get_user_request_quota_remaining(user_id)
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "Request quota exceeded. Please increase your quota.",
+                    "code": "quota_exceeded",
+                    "request_quota_remaining": remaining,
+                },
+            )
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to consume request quota: {e!s}",
+        )
 
     conv = load(conversation_id) if conversation_id else None
     if not conv:
@@ -163,6 +742,11 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
         state = conv["state"]
         context = conv["context"].copy()
         persisted_context = None
+
+    if personal_profile:
+        context["personal_profile"] = {
+            k: v for k, v in personal_profile.items() if isinstance(v, (str, int, float, bool))
+        }
 
     # Resolve current state string for branching.
     current_state_str = state.value if hasattr(state, "value") else state
@@ -230,6 +814,99 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 new_state, updated_context, reply_text, ui_options = return_transition(
                     return_state, combined_message, context
                 )
+
+    if (
+        new_state is None
+        and at_entry_no_flow
+        and _BILL_DISPUTE_RE.search(raw_message or "")
+        and extracted_billing_phone
+    ):
+        context["flow_type"] = FLOW_GENERAL_CALL
+        combined_message = (
+            f"Please call {extracted_billing_phone} and dispute my bill based on the uploaded bill details."
+        )
+        new_state, updated_context, reply_text, ui_options = return_transition(
+            ReturnFlowState.AWAITING_PHONE_OR_ZIP, combined_message, context
+        )
+
+    if new_state is None and at_entry_no_flow:
+        queue_payload = _parse_parking_queue_payload(message)
+        if queue_payload:
+            selected_places = queue_payload["places"]
+            context["selected_clinics"] = selected_places
+            context["hospital_phone"] = selected_places[0]["phone"]
+            context["call_reason"] = queue_payload["call_reason"]
+            context["flow_type"] = FLOW_GENERAL_CALL
+            if queue_payload.get("flow_tag"):
+                context["insurance_precall_required"] = (
+                    queue_payload.get("flow_tag") == "insurance_search"
+                )
+            return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
+            new_state, updated_context, reply_text, ui_options = return_transition(
+                return_state, message, context
+            )
+
+    if new_state is None and at_entry_no_flow and _PLACE_SEARCH_RE.search(message or ""):
+        if _needs_location_for_nearby_search(message):
+            new_state, updated_context, reply_text, ui_options = (
+                state,
+                context,
+                _location_clarify_reply(),
+                None,
+            )
+        else:
+            searched = _place_search_reply(message)
+            if searched:
+                searched_reply, searched_options = searched
+                new_state, updated_context, reply_text, ui_options = (
+                    state,
+                    context,
+                    searched_reply,
+                    searched_options,
+                )
+
+    if new_state is None and at_entry_no_flow and _INSURANCE_SEARCH_RE.search(message or ""):
+        searched = _insurance_search_reply(message)
+        if searched:
+            searched_reply, searched_options = searched
+            new_state, updated_context, reply_text, ui_options = (
+                state,
+                context,
+                searched_reply,
+                searched_options,
+            )
+
+    if new_state is None and at_entry_no_flow and _CAL_BOOKING_INTENT_RE.search(message or ""):
+        cal_reply = _cal_booking_reply(message, personal_profile)
+        if cal_reply:
+            searched_reply, searched_options = cal_reply
+            new_state, updated_context, reply_text, ui_options = (
+                state,
+                context,
+                searched_reply,
+                searched_options,
+            )
+
+    if new_state is None and at_entry_no_flow:
+        cal_payload = _parse_cal_booking_payload(message)
+        if cal_payload:
+            slot_start_at = cal_payload["slot_start_at"]
+            timezone = cal_payload["timezone"]
+            booking_url = cal_payload.get("booking_url") or ""
+            context["flow_type"] = FLOW_GENERAL_CALL
+            context["booking_start_at"] = slot_start_at
+            context["booking_timezone"] = timezone
+            context["availability"] = f"{slot_start_at} ({timezone})"
+            context["call_reason"] = f"Book an appointment at {slot_start_at} ({timezone})"
+            context["call_details"] = (
+                f"Booking target slot: {slot_start_at}\n"
+                f"Timezone: {timezone}\n"
+                + (f"Cal.com booking page: {booking_url}" if booking_url else "")
+            ).strip()
+            return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
+            new_state, updated_context, reply_text, ui_options = return_transition(
+                return_state, "I want to book this appointment slot", context
+            )
 
     if new_state is None:
         route = route_flow(
@@ -451,16 +1128,16 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                     )
 
     base_context = updated_context if updated_context is not None else context
-    merged_context = update_reply_locale_from_message(dict(base_context), message)
-    if reply_text and should_localize_to_chinese(merged_context, message):
-        reply_text = localize_assistant_reply(reply_text, user_message=message)
+    merged_context = update_reply_locale_from_message(dict(base_context), raw_message)
+    if reply_text and should_localize_to_chinese(merged_context, raw_message):
+        reply_text = localize_assistant_reply(reply_text, user_message=raw_message)
     persisted_context = _context_for_redis(merged_context)
     save(conversation_id, user_id, new_state, persisted_context)
 
     new_state_value = new_state.value if hasattr(new_state, "value") else new_state
     try:
         update_conversation(conversation_id, new_state_value, persisted_context)
-        append_messages(conversation_id, message, reply_text)
+        append_messages(conversation_id, raw_message, reply_text)
     except Exception as e:
         raise HTTPException(
             status_code=503,
@@ -471,7 +1148,9 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     placed_call_id: str | None = None
     placed_call_reason: str | None = None
     placed_domain: str | None = None
+    queued_calls: list[dict[str, str]] = []
     call_reason_effective: str | None = None
+    call_placement_hints = None
     is_confirmed = new_state_value in (
         ConversationState.CONFIRMED.value,
         ReturnFlowState.CONFIRMED.value,
@@ -487,10 +1166,14 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             else "Veterinary service inquiry"
         )
         call_reason_effective = persisted_context.get("call_reason") or default_reason
+        call_additional_instructions = (
+            str(persisted_context.get("call_details") or "").strip()[:2000]
+        )
         payload = {
             "zip": persisted_context.get("zip"),
             "hospital_phone": persisted_context.get("hospital_phone"),
             "call_reason": persisted_context.get("call_reason"),
+            "call_details": persisted_context.get("call_details"),
             "pet_profile_id": persisted_context.get("pet_profile_id"),
             "name": persisted_context.get("name"),
             "breed": persisted_context.get("breed"),
@@ -508,18 +1191,72 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 detail=f"Conversation confirmed but task creation failed: {e!s}",
             )
 
-        phone = (persisted_context.get("hospital_phone") or "").strip()
-        if task_id and phone and call_backend_configured():
+        selected = persisted_context.get("selected_clinics") or []
+        queue_targets: list[str] = []
+        seen_phones: set[str] = set()
+        if isinstance(selected, list):
+            for c in selected:
+                if not isinstance(c, dict):
+                    continue
+                p = str(c.get("phone") or "").strip()
+                if p and p not in seen_phones:
+                    seen_phones.add(p)
+                    queue_targets.append(p)
+        fallback_phone = (persisted_context.get("hospital_phone") or "").strip()
+        if fallback_phone and fallback_phone not in seen_phones:
+            queue_targets.append(fallback_phone)
+
+        if task_id and queue_targets and call_backend_configured():
             auth = resolve_bearer_token(request.headers.get("authorization"))
-            placement = place_outbound_call(
-                phone,
-                call_reason_effective,
-                bearer_token=auth,
+            caller_first_name = _resolve_profile_first_name(
+                persisted_context.get("personal_profile")
             )
-            if placement.get("callId"):
-                placed_call_id = placement["callId"]
-                placed_call_reason = placement.get("callReason") or call_reason_effective
-                placed_domain = placement.get("domain") or "unknown"
+            call_placement_hints = {
+                k: v
+                for k, v in build_call_backend_payload(
+                    queue_targets[0],
+                    call_reason_effective,
+                    additional_instructions=call_additional_instructions or None,
+                    caller_name=caller_first_name or None,
+                ).items()
+                if k != "phone_number"
+            }
+            queued_call_ids: list[str] = []
+            selected_by_phone: dict[str, dict] = {}
+            if isinstance(selected, list):
+                for c in selected:
+                    if not isinstance(c, dict):
+                        continue
+                    p = str(c.get("phone") or "").strip()
+                    if p and p not in selected_by_phone:
+                        selected_by_phone[p] = c
+            for target_phone in queue_targets:
+                placement = place_outbound_call(
+                    target_phone,
+                    call_reason_effective,
+                    bearer_token=auth,
+                    additional_instructions=call_additional_instructions or None,
+                    caller_name=caller_first_name or None,
+                )
+                if placement.get("callId"):
+                    call_id = str(placement["callId"])
+                    queued_call_ids.append(call_id)
+                    selected_item = selected_by_phone.get(target_phone) or {}
+                    queued_calls.append(
+                        {
+                            "callId": call_id,
+                            "phone": target_phone,
+                            "name": str(selected_item.get("name") or "").strip()
+                            or target_phone,
+                        }
+                    )
+                    if not placed_call_id:
+                        placed_call_id = call_id
+                        placed_call_reason = placement.get("callReason") or call_reason_effective
+                        placed_domain = placement.get("domain") or "unknown"
+                elif placement.get("error"):
+                    print(f"[Chat] placeCall failed for {target_phone}: {placement.get('error')}")
+            if placed_call_id:
                 try:
                     update_task(
                         task_id,
@@ -527,6 +1264,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                         payload={
                             "type": "call",
                             "callId": placed_call_id,
+                            "queuedCallIds": queued_call_ids,
                             "callReason": placed_call_reason,
                             "title": placed_domain,
                             "description": placed_call_reason,
@@ -535,13 +1273,14 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                     )
                 except Exception as patch_err:
                     print(f"[Chat] Failed to update task with callId: {patch_err}")
-            elif placement.get("error"):
-                print(f"[Chat] placeCall failed: {placement.get('error')}")
 
     result = {
         "reply_text": reply_text,
         "conversation_id": conversation_id,
         "debug_state": new_state_value,
+        "request_quota_remaining": request_quota_remaining,
+        # Keep this alias for existing UI hooks until renamed.
+        "free_trial_remaining": request_quota_remaining,
     }
     if ui_options is not None:
         result["ui_options"] = ui_options
@@ -555,6 +1294,10 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             result["callId"] = placed_call_id
             result["callReason"] = placed_call_reason
             result["domain"] = placed_domain
+        if queued_calls:
+            result["queued_calls"] = queued_calls
+        if call_placement_hints is not None:
+            result["call_placement_hints"] = call_placement_hints
     return result
 
 
@@ -566,6 +1309,23 @@ def get_conversations_list(user_id: str) -> dict:
     try:
         items = list_conversations(user_id)
         return {"conversations": items}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/users/{user_id}/request-quota")
+def get_request_quota(user_id: str) -> dict:
+    """Get request quota totals for a user."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        quota = get_user_request_quota(user_id)
+        return {
+            "user_id": user_id,
+            "request_quota_total": quota["total"],
+            "request_quota_used": quota["used"],
+            "request_quota_remaining": quota["remaining"],
+        }
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 

@@ -14,6 +14,7 @@ import {
   Bot, 
   FileText, 
   Download,
+  Paperclip,
   CheckCircle,
   AlertCircle,
   ChevronDown,
@@ -238,6 +239,29 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
                   <label className="text-sm font-medium text-muted-foreground">Desired Outcome</label>
                   <p>{task.desiredOutcome}</p>
                 </div>
+                {task.billDetails && (
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-muted-foreground">Bill Details</label>
+                    {task.billDetails.companyProviderName && <p className="text-sm"><strong>Provider:</strong> {task.billDetails.companyProviderName}</p>}
+                    {task.billDetails.billAmount && <p className="text-sm"><strong>Amount:</strong> {task.billDetails.billAmount}</p>}
+                    {task.billDetails.accountOrInvoiceNumber && <p className="text-sm"><strong>Account/Invoice:</strong> {task.billDetails.accountOrInvoiceNumber}</p>}
+                    {task.billDetails.billDueDate && <p className="text-sm"><strong>Due Date:</strong> {task.billDetails.billDueDate}</p>}
+                    {task.billDetails.chargeOrServiceDate && <p className="text-sm"><strong>Service Date:</strong> {task.billDetails.chargeOrServiceDate}</p>}
+                  </div>
+                )}
+                {Array.isArray(task.attachments) && task.attachments.length > 0 && (
+                  <div>
+                    <label className="text-sm font-medium text-muted-foreground">Uploaded Documents</label>
+                    <div className="mt-1 space-y-1">
+                      {task.attachments.map((attachment) => (
+                        <div key={attachment.path} className="text-sm flex items-center gap-2">
+                          <Paperclip className="w-3 h-3 text-muted-foreground" />
+                          <span>{attachment.fileName}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 
                 <div>
                   <label className="text-sm font-medium text-muted-foreground">Status</label>

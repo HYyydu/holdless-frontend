@@ -26,7 +26,8 @@ const usStates = [
 
 interface ProfileSectionProps {
   profile: {
-    name: string;
+    firstName: string;
+    lastName: string;
     email: string;
     phone: string;
     address: string;
@@ -51,17 +52,30 @@ export function ProfileSection({ profile, onUpdateProfile }: ProfileSectionProps
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-5">
-          {/* Name & Email Row */}
+          {/* Name Row */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="name" className="text-sm font-medium text-foreground">Full Name</Label>
+              <Label htmlFor="firstName" className="text-sm font-medium text-foreground">First Name</Label>
               <Input 
-                id="name"
-                value={profile.name}
-                onChange={(e) => onUpdateProfile('name', e.target.value)}
+                id="firstName"
+                value={profile.firstName}
+                onChange={(e) => onUpdateProfile('firstName', e.target.value)}
                 className="h-11 border-border/60 focus:border-primary/50 transition-colors"
               />
             </div>
+            <div className="space-y-2">
+              <Label htmlFor="lastName" className="text-sm font-medium text-foreground">Last Name</Label>
+              <Input 
+                id="lastName"
+                value={profile.lastName}
+                onChange={(e) => onUpdateProfile('lastName', e.target.value)}
+                className="h-11 border-border/60 focus:border-primary/50 transition-colors"
+              />
+            </div>
+          </div>
+
+          {/* Email Row */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label htmlFor="email" className="text-sm font-medium text-foreground">Email</Label>
               <Input 

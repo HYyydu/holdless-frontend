@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback } from 'react';
+import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { Task } from '@/components/TaskCard';
 import { NewTaskDialog } from '@/components/NewTaskDialog';
 import { TaskDetailsDialog } from '@/components/TaskDetailsDialog';
@@ -21,7 +21,8 @@ import { usePets } from '@/hooks/usePets';
 import { useTasks, taskToPayload } from '@/hooks/useTasks';
 import { useDemoAuth } from '@/contexts/DemoAuthContext';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
-import { summarizeCall, retryCall, getCallStatusWithMeta } from '@/lib/chatApi';
+import { summarizeCall, retryCall, getCallStatusWithMeta, getUserRequestQuota, type ChatAttachmentPayload } from '@/lib/chatApi';
+import { createCallTokenPatchBatcher } from '@/lib/callTokenPatchBatcher';
 import { useCallUsageSocket } from '@/hooks/useCallUsageSocket';
 
 // Sample data with vendor logos
@@ -78,6 +79,7 @@ const Dashboard = () => {
   const [conversationMessage, setConversationMessage] = useState('');
   const [historyConversationId, setHistoryConversationId] = useState<string | null>(null);
   const [historyInitialMessages, setHistoryInitialMessages] = useState<{ role: string; content: string }[] | null>(null);
+  const [initialAttachments, setInitialAttachments] = useState<ChatAttachmentPayload[]>([]);
   
   // Task badge state for +1 animation
   const [taskBadge, setTaskBadge] = useState<number | null>(null);
@@ -92,6 +94,7 @@ const Dashboard = () => {
     label: string;
   }>({ open: false, callId: null, label: '' });
   const [freeTrialRemaining, setFreeTrialRemaining] = useState<number | null>(null);
+  const [freeTrialLimit, setFreeTrialLimit] = useState<number | null>(null);
 
   // Filter states
   const [activeFilter, setActiveFilter] = useState<TaskFilter>('all');
@@ -116,6 +119,36 @@ const Dashboard = () => {
     updateCallTaskByCallId,
   } = useTasks(userId);
   const { callBackendToken } = useCallBackendAuth();
+
+  const callTasksRef = useRef(callTasks);
+  callTasksRef.current = callTasks;
+  const handleCallTaskStatusUpdateRef = useRef<
+    | ((
+        callId: string,
+        status: 'in_progress' | 'resolved',
+        payloadPatch?: Record<string, unknown>,
+      ) => void | Promise<void>)
+    | null
+  >(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadRequestQuota = async () => {
+      if (!userId) {
+        setFreeTrialRemaining(null);
+        setFreeTrialLimit(null);
+        return;
+      }
+      const quota = await getUserRequestQuota(userId);
+      if (!quota || cancelled) return;
+      setFreeTrialRemaining(quota.request_quota_remaining);
+      setFreeTrialLimit(quota.request_quota_total);
+    };
+    void loadRequestQuota();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
 
   // Use task from callTasks when available so status updates (e.g. after call_ended) reflect in Task Details
   const effectiveSelectedCallTask = useMemo(
@@ -181,9 +214,13 @@ const Dashboard = () => {
     setNewTaskDialogOpen(false);
   };
 
-  const handleStartTask = (description: string) => {
+  const handleStartTask = (
+    description: string,
+    options?: { attachments?: ChatAttachmentPayload[] }
+  ) => {
     // Open conversation view instead of task dialog
     setConversationMessage(description);
+    setInitialAttachments(options?.attachments ?? []);
     setShowConversation(true);
   };
 
@@ -192,12 +229,14 @@ const Dashboard = () => {
     setConversationMessage('');
     setHistoryConversationId(null);
     setHistoryInitialMessages(null);
+    setInitialAttachments([]);
   };
 
   const handleSelectConversationToContinue = (conversationId: string, messages: { role: string; content: string }[]) => {
     setHistoryConversationId(conversationId);
     setHistoryInitialMessages(messages);
     setConversationMessage('');
+    setInitialAttachments([]);
     setShowConversation(true);
   };
 
@@ -245,15 +284,31 @@ const Dashboard = () => {
     }
   };
 
+  handleCallTaskStatusUpdateRef.current = handleCallTaskStatusUpdate;
+
+  const callTokenBatcher = useMemo(
+    () =>
+      createCallTokenPatchBatcher(2000, (callId, patch) => {
+        const task = callTasksRef.current.find((t) => t.callId === callId);
+        const status: "in_progress" | "resolved" = task?.status === "resolved" ? "resolved" : "in_progress";
+        void handleCallTaskStatusUpdateRef.current?.(callId, status, patch);
+      }),
+    [],
+  );
+
   const persistCallTokensRef = useRef<
     (callId: string, patch: Record<string, unknown>) => void | Promise<void>
   >(async () => {});
 
   persistCallTokensRef.current = async (callId: string, patch: Record<string, unknown>) => {
-    const task = callTasks.find((t) => t.callId === callId);
-    const status: "in_progress" | "resolved" = task?.status === "resolved" ? "resolved" : "in_progress";
-    await handleCallTaskStatusUpdate(callId, status, patch);
+    callTokenBatcher.push(callId, patch);
   };
+
+  useEffect(() => {
+    return () => {
+      callTokenBatcher.flushAll();
+    };
+  }, [callTokenBatcher]);
 
   const isReplayTranscript =
     typeof transcriptTask?.payload?.transcript === "string" &&
@@ -281,14 +336,15 @@ const Dashboard = () => {
         callBackendToken: callBackendToken ?? undefined,
       });
       if (!meta.ok || !meta.data) return;
-      const d = meta.data as Record<string, unknown>;
+      const d = meta.data;
       const patch: Record<string, unknown> = {};
       if (typeof d.input_tokens === "number") patch.input_tokens = d.input_tokens;
       if (typeof d.output_tokens === "number") patch.output_tokens = d.output_tokens;
       if (Object.keys(patch).length === 0) return;
-      await persistCallTokensRef.current(callId, patch);
+      callTokenBatcher.push(callId, patch);
+      callTokenBatcher.flushCall(callId);
     },
-    [callBackendToken],
+    [callBackendToken, callTokenBatcher],
   );
 
   const handleRetryCall = async (
@@ -407,6 +463,7 @@ const Dashboard = () => {
             onBack={handleBackFromConversation}
             initialConversationId={historyConversationId ?? undefined}
             initialMessages={historyInitialMessages ?? undefined}
+            initialAttachments={initialAttachments}
             onTaskCreated={handleTaskCreatedFromConversation}
             onCallTaskCreated={handleCallTaskCreated}
             onCallTaskStatusUpdate={handleCallTaskStatusUpdate}
@@ -448,6 +505,7 @@ const Dashboard = () => {
             callTasks={callTasks}
             onOpenSettings={() => setActiveTab('settings')}
             freeTrialRemaining={freeTrialRemaining}
+            freeTrialLimit={freeTrialLimit ?? undefined}
           />
         )}
 
@@ -479,6 +537,7 @@ const Dashboard = () => {
 
       <NewTaskDialog 
         onCreateTask={handleCreateTask}
+        userId={userId}
         open={newTaskDialogOpen}
         onOpenChange={setNewTaskDialogOpen}
         initialDescription={initialTaskDescription}

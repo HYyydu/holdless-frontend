@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { Dialog, DialogContent } from '@/components/ui/dialog';
-import { Phone, PhoneOff, Mic, Volume2 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Phone, PhoneOff, Mic, Volume2, PhoneForwarded } from 'lucide-react';
 import { io, type Socket } from 'socket.io-client';
 import {
   CALL_STATUS_SESSION_GRACE_MS,
@@ -8,7 +9,10 @@ import {
   getCallBackendUrl,
   getTranscripts,
   isCallEndedStatus,
+  joinCallConference,
 } from '@/lib/chatApi';
+import { toE164UsPreferred } from '@/lib/phoneE164';
+import { useUserProfile } from '@/hooks/useUserProfile';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
 import { toast } from 'sonner';
 import { parseUsageUpdatePayload } from '@/lib/callUsageTypes';
@@ -114,6 +118,11 @@ function parseDurationToSeconds(s: string): number {
   return 0;
 }
 
+function isInProgressCallStatus(s: string | null | undefined): boolean {
+  if (s == null) return false;
+  return String(s).toLowerCase().replace(/\s+/g, '_') === 'in_progress';
+}
+
 export function LiveTranscriptModal({ 
   open, 
   onOpenChange, 
@@ -143,6 +152,14 @@ export function LiveTranscriptModal({
   transcriptSnapshotRef.current = transcript;
   const useRealTranscript = Boolean(callId);
   const callStatusOpts = { callBackendToken: callBackendToken ?? undefined };
+  const { profile } = useUserProfile();
+
+  /** For “Join the call” — from GET /api/call and Socket call_status. */
+  const [remoteCallStatus, setRemoteCallStatus] = useState<string | null>(null);
+  const [userJoinedAt, setUserJoinedAt] = useState<string | null>(null);
+  const [joinInFlight, setJoinInFlight] = useState(false);
+  /** After 200 on join, or we’re past redirect (human_joined can arrive slightly later). */
+  const [postJoinInfo, setPostJoinInfo] = useState(false);
 
   callDurationRef.current = callDuration;
 
@@ -173,6 +190,32 @@ export function LiveTranscriptModal({
       }
     }
   }, [open, initialTranscript, initialCallDuration]);
+
+  // Conference join: reset when switching call / reopening; poll status for in_progress and user_joined_at.
+  useEffect(() => {
+    if (!open) return;
+    setRemoteCallStatus(null);
+    setUserJoinedAt(null);
+    setJoinInFlight(false);
+    setPostJoinInfo(false);
+  }, [open, callId]);
+
+  useEffect(() => {
+    if (!open || !callId || (initialTranscript ?? '').trim() !== '') return;
+    const sync = async () => {
+      const meta = await getCallStatusWithMeta(callId, {
+        callBackendToken: callBackendToken ?? undefined,
+      });
+      if (!meta.ok) return;
+      setRemoteCallStatus(meta.data.status);
+      if (meta.data.user_joined_at) setUserJoinedAt(meta.data.user_joined_at);
+    };
+    void sync();
+    const id = setInterval(() => {
+      void sync();
+    }, 5000);
+    return () => clearInterval(id);
+  }, [open, callId, initialTranscript, callBackendToken]);
 
   // Call duration timer
   useEffect(() => {
@@ -283,6 +326,8 @@ export function LiveTranscriptModal({
         return;
       }
       const status = meta.data;
+      setRemoteCallStatus(status.status);
+      if (status.user_joined_at) setUserJoinedAt(status.user_joined_at);
       const lines: TranscriptLine[] = (status.transcript || []).map((t) => toTranscriptLine(t));
       // Never replace a live Socket.io transcript with an empty poll result — status API often omits transcript after end.
       if (lines.length > 0) applyTranscript(lines);
@@ -439,6 +484,9 @@ export function LiveTranscriptModal({
           const handleStatus = (data: unknown) => {
             const d = typeof data === 'object' && data !== null ? data as Record<string, unknown> : {};
             const statusVal = (d.status as string) ?? (d.call_status as string);
+            if (statusVal) setRemoteCallStatus(String(statusVal));
+            if (d.user_joined_at != null)
+              setUserJoinedAt(String(d.user_joined_at));
             const rawTranscript = d.transcript ?? d.lines;
             const arr = Array.isArray(rawTranscript) ? rawTranscript : [];
             const lines = arr.map((item: unknown) => toTranscriptLine(
@@ -470,6 +518,13 @@ export function LiveTranscriptModal({
 
           socket.on('call_status', handleStatus);
           socket.on('status', handleStatus);
+
+          socket.on('human_joined', (payload: unknown) => {
+            const o = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>) : {};
+            if (String(o.call_id ?? '') !== String(callId)) return;
+            if (o.joined_at != null) setUserJoinedAt(String(o.joined_at));
+            setPostJoinInfo(true);
+          });
 
           // Strong "call ended" signal from backend (CREATE_CALL_API.md § Getting Live Transcripts).
           socket.on('call_ended', (payload?: unknown) => {
@@ -592,6 +647,52 @@ export function LiveTranscriptModal({
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const profilePhoneTrimmed = (profile.phone ?? "").trim();
+  const e164 = toE164UsPreferred(profilePhoneTrimmed);
+  const isLiveTranscriptView =
+    Boolean(callId) &&
+    useRealTranscript &&
+    (initialTranscript ?? "").trim() === "";
+  const inProgressRemote = isInProgressCallStatus(remoteCallStatus);
+  const showPostJoinMessage =
+    isCallActive && isLiveTranscriptView && (userJoinedAt != null || postJoinInfo);
+  const canOfferJoinCta =
+    isCallActive &&
+    isLiveTranscriptView &&
+    inProgressRemote &&
+    !userJoinedAt &&
+    !postJoinInfo;
+
+  const onJoinCallClick = async () => {
+    if (!callId) return;
+    if (!e164) {
+      toast.error(
+        !profilePhoneTrimmed
+          ? "Please add your phone number in personal information first."
+          : "Please add a valid phone number in personal information first (e.g. +1 415 555 1234).",
+      );
+      return;
+    }
+    setJoinInFlight(true);
+    try {
+      const r = await joinCallConference(callId, e164, callStatusOpts);
+      if (r.ok) {
+        setPostJoinInfo(true);
+        toast.success(
+          "You should get a call from the app number. Answer to join the representative in the same conversation.",
+        );
+      } else if (r.status === 409) {
+        toast.error("You have already joined this call.");
+        const meta = await getCallStatusWithMeta(callId, callStatusOpts);
+        if (meta.ok && meta.data.user_joined_at) setUserJoinedAt(meta.data.user_joined_at);
+      } else {
+        toast.error(r.message);
+      }
+    } finally {
+      setJoinInFlight(false);
+    }
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl max-h-[85vh] p-0 overflow-hidden">
@@ -627,6 +728,46 @@ export function LiveTranscriptModal({
             </div>
           </div>
         </div>
+
+        {/* Join via callback into Twilio conference (live calls only) */}
+        {isLiveTranscriptView && isCallActive && (showPostJoinMessage || (inProgressRemote && canOfferJoinCta)) && (
+          <div className="border-b border-blue-100 bg-gradient-to-b from-blue-50/90 to-slate-50/40 px-4 py-3">
+            {showPostJoinMessage ? (
+              <p className="text-sm text-center text-slate-800">
+                Connecting to your phone… answer the incoming call to join the representative. The AI
+                on this line will stop when you are connected.
+              </p>
+            ) : inProgressRemote && canOfferJoinCta ? (
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-center gap-2 sm:gap-3 max-w-lg mx-auto">
+                <p className="text-xs text-slate-600 sm:flex-1 text-center sm:text-left sm:min-w-0">
+                  {e164
+                    ? "We will call the number in Personal information (Profile) on the same line as the business."
+                    : "Add a phone under Profile → Personal information. We will call that number to connect you to this call."}
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  className={
+                    e164
+                      ? "bg-blue-600 hover:bg-blue-700 text-white shrink-0"
+                      : "shrink-0 text-slate-700 border border-slate-300 bg-white hover:bg-slate-50"
+                  }
+                  disabled={e164 && joinInFlight}
+                  onClick={() => void onJoinCallClick()}
+                >
+                  {e164 && joinInFlight ? (
+                    "Requesting…"
+                  ) : (
+                    <>
+                      <PhoneForwarded className="w-4 h-4 mr-2" />
+                      Join the call
+                    </>
+                  )}
+                </Button>
+              </div>
+            ) : null}
+          </div>
+        )}
 
         {/* Transcript Area */}
         <div 

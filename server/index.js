@@ -104,6 +104,15 @@ function getCallBackendToken(req) {
   return bearer || fromBody || "";
 }
 
+function resolveCallerFirstName(personalProfile) {
+  if (!personalProfile || typeof personalProfile !== "object") return "";
+  const explicitFirst = String(personalProfile.firstName || "").trim();
+  if (explicitFirst) return explicitFirst;
+  const fullName = String(personalProfile.name || "").trim();
+  if (!fullName) return "";
+  return fullName.split(/\s+/)[0] || "";
+}
+
 if (!serveSpa) {
   app.get("/", (req, res) => {
     res.json({
@@ -128,10 +137,12 @@ if (!serveSpa) {
 // When frontend uses Node (VITE_API_TARGET=3001), these routes are forwarded so Profile pets and History work.
 app.all("/api/pet-profiles", proxyToPython);
 app.all("/api/pet-profiles/:id", proxyToPython);
+app.get("/api/users/:user_id/request-quota", proxyToPython);
 app.get("/api/conversations", proxyToPython);
 app.delete("/api/conversations/:id", proxyToPython);
 app.get("/api/conversations/:id/messages", proxyToPython);
 app.all("/api/tasks", proxyToPython);
+app.all("/api/tasks/extract-bill-fields", proxyToPython);
 app.all("/api/tasks/:taskId", proxyToPython);
 
 // Proxy call-backend auth so frontend can sign in without CORS. Token is then sent as Bearer on /api/chat and /api/call/:id.
@@ -708,19 +719,40 @@ async function placeCallViaBackend(
   const rawPurpose = stripPhoneNumbersFromPurpose(
     (callReason || "").trim() || "Customer inquiry",
   );
-  const purpose = (await translateToEnglish(rawPurpose)).slice(
-    0,
-    PURPOSE_SUMMARY_MAX_LENGTH,
+  const hintPurpose =
+    options.purpose != null && String(options.purpose).trim()
+      ? String(options.purpose).trim()
+      : "";
+  const hasRichGuidance = Boolean(
+    hintPurpose ||
+      (options.agent_prompt != null && String(options.agent_prompt).trim()) ||
+      (options.opening_line != null && String(options.opening_line).trim()) ||
+      (Array.isArray(options.talking_points) && options.talking_points.length),
   );
+  let purpose = hintPurpose
+    ? hintPurpose.slice(0, PURPOSE_SUMMARY_MAX_LENGTH)
+    : (await translateToEnglish(rawPurpose)).slice(
+        0,
+        PURPOSE_SUMMARY_MAX_LENGTH,
+      );
   // Intent classification runs before every call (domain, task, confidence for routing/tagging).
-  const intent = await classifyIntent(callReason || purpose);
-  if (intent) {
+  // Skip when Python already sent agent_prompt / opening_line — insurance intent routing can
+  // override consumer role and sound like a representative.
+  let intent = null;
+  if (!hasRichGuidance) {
+    intent = await classifyIntent(callReason || purpose);
+    if (intent) {
+      console.log(
+        "[Call] intent classification:",
+        intent.domain,
+        intent.task,
+        "confidence:",
+        intent.confidence,
+      );
+    }
+  } else {
     console.log(
-      "[Call] intent classification:",
-      intent.domain,
-      intent.task,
-      "confidence:",
-      intent.confidence,
+      "[Call] intent classification skipped (rich call guidance from Python)",
     );
   }
   const callName =
@@ -736,11 +768,27 @@ async function placeCallViaBackend(
       String(options.voice_preference).trim() && {
         voice_preference: String(options.voice_preference).trim(),
       }),
-    ...(options.additional_instructions != null &&
-      String(options.additional_instructions).trim() && {
-        additional_instructions: String(options.additional_instructions).trim(),
-      }),
   };
+  if (
+    options.additional_instructions != null &&
+    String(options.additional_instructions).trim()
+  ) {
+    body.additional_instructions = String(
+      options.additional_instructions,
+    ).trim();
+  }
+  if (options.opening_line != null && String(options.opening_line).trim()) {
+    body.opening_line = String(options.opening_line).trim();
+  }
+  if (options.agent_prompt != null && String(options.agent_prompt).trim()) {
+    body.agent_prompt = String(options.agent_prompt).trim();
+  }
+  if (Array.isArray(options.talking_points) && options.talking_points.length) {
+    body.talking_points = options.talking_points;
+  }
+  if (options.call_brief != null && typeof options.call_brief === "object") {
+    body.call_brief = options.call_brief;
+  }
   const timeoutMs = Number(process.env.CALL_BACKEND_TIMEOUT_MS) || 15000;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -964,6 +1012,10 @@ async function getCallStatusFromBackend(callId, token) {
         endedAt: call.ended_at ?? call.endedAt ?? call.completed_at,
         cost: call.cost,
         phone_number: call.phone_number ?? data.phone_number,
+        user_joined_at:
+          call.user_joined_at ?? call.userJoinedAt ?? data.user_joined_at ?? null,
+        input_tokens: call.input_tokens ?? data.input_tokens,
+        output_tokens: call.output_tokens ?? data.output_tokens,
       };
     } catch (err) {
       clearTimeout(timeoutId);
@@ -1125,16 +1177,24 @@ app.post("/api/chat", async (req, res) => {
         ) {
           const callReason = data.call_reason || "Veterinary service inquiry";
           const token = getCallBackendToken(req);
+          const callerFirstName = resolveCallerFirstName(
+            req.body?.personal_profile,
+          );
           const userId = req.body?.user_id || "";
           const taskId = data.task_id;
           console.log(
             "[Chat] CONFIRMED with hospital_phone, placing call via call backend",
             { taskId, phone: data.hospital_phone },
           );
+          const hints = data.call_placement_hints || {};
           const callResult = await placeCall(
             data.hospital_phone,
             callReason,
             token,
+            {
+              ...hints,
+              ...(callerFirstName ? { name: callerFirstName } : {}),
+            },
           );
           if (callResult.callId && !callResult.error) {
             data.callId = callResult.callId;
@@ -1201,8 +1261,10 @@ app.post("/api/chat", async (req, res) => {
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages array is required" });
   }
-  const profileName =
-    req.body?.profileName != null ? String(req.body.profileName).trim() : "";
+  const profileFirstName =
+    req.body?.profileFirstName != null
+      ? String(req.body.profileFirstName).trim()
+      : "";
   const callBackendToken = getCallBackendToken(req);
   const fromHeader = req.headers?.authorization?.startsWith("Bearer ");
   const fromBody = !!(
@@ -1219,8 +1281,8 @@ app.post("/api/chat", async (req, res) => {
     !!CALL_API_TOKEN,
   );
 
-  const systemContent = profileName
-    ? `${SYSTEM_PROMPT}\n\nUSER PROFILE NAME: The user's profile name is "${profileName}". When asking for the call name, suggest it: "What name should I use for the call? (Your profile name is ${profileName}, or type a different name.)"`
+  const systemContent = profileFirstName
+    ? `${SYSTEM_PROMPT}\n\nUSER PROFILE FIRST NAME: The user's first name is "${profileFirstName}". Use this as the default caller name when appropriate. If caller name is missing before a call, ask: "Who am I calling for?" and confirm before placing the call.`
     : SYSTEM_PROMPT;
 
   const openaiMessages = [
@@ -1292,7 +1354,7 @@ app.post("/api/chat", async (req, res) => {
         "[Chat] Model returned TEXT instead of tool_calls. Full content (first 400 chars):",
         message.content.trim().slice(0, 400),
       );
-      // In call-request flow, prepend "Description: {purpose}" (same as backend) for confirmation
+      // In call-request flow, prepend "Purpose: {purpose}" (same as backend) for confirmation
       if (hasCallRequest) {
         const purpose = await summarizeChatToPurpose(
           openaiMessages,
@@ -1300,10 +1362,10 @@ app.post("/api/chat", async (req, res) => {
         );
         message = {
           ...message,
-          content: `Description: ${purpose}\n\n${(message.content || "").trim()}`,
+          content: `Purpose: ${purpose}\n\n${(message.content || "").trim()}`,
         };
         console.log(
-          "[Chat] Confirmation message includes Description (purpose length):",
+          "[Chat] Confirmation message includes Purpose (purpose length):",
           purpose.length,
         );
       }
@@ -1666,6 +1728,62 @@ app.post("/api/call/retry", async (req, res) => {
       .json({ error: "Place call did not return a call ID." });
   }
   return res.json({ callId: callResult.callId });
+});
+
+/**
+ * POST /api/calls/:callId/join — outbound dial to bring the user into the same Twilio conference.
+ * Body: { to_phone: string } (E.164). Proxies to call backend. Auth: same as other call endpoints.
+ */
+app.post("/api/calls/:callId/join", async (req, res) => {
+  const { callId } = req.params;
+  if (!callId) {
+    return res.status(400).json({ error: "callId required" });
+  }
+  if (!USE_CALL_BACKEND) {
+    return res
+      .status(503)
+      .json({ error: "Call backend not configured. Set CALL_BACKEND_URL." });
+  }
+  const token =
+    req.headers?.authorization &&
+    req.headers.authorization.startsWith("Bearer ")
+      ? req.headers.authorization.slice(7).trim()
+      : CALL_API_TOKEN;
+  if (!token && !CALL_BACKEND_ALLOW_NO_AUTH) {
+    return res.status(401).json({
+      error: "Authorization required. Send Bearer token or set CALL_API_TOKEN.",
+    });
+  }
+  const toPhone =
+    typeof req.body?.to_phone === "string" ? req.body.to_phone.trim() : "";
+  if (!toPhone) {
+    return res
+      .status(400)
+      .json({ error: "to_phone is required in request body (E.164)." });
+  }
+  const url = `${CALL_BACKEND_URL}/api/calls/${callId}/join`;
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...callBackendExtraFetchHeaders(),
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  try {
+    const backendRes = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ to_phone: toPhone }),
+    });
+    const text = await backendRes.text();
+    res.status(backendRes.status);
+    res.setHeader("Content-Type", "application/json");
+    res.send(text);
+  } catch (err) {
+    console.error("[Call] POST /api/calls/:callId/join error:", err.message);
+    res
+      .status(502)
+      .json({ error: "Call backend unavailable", detail: err.message });
+  }
 });
 
 // GET /api/calls/:callId/transcripts - Fetch full transcript records for a call (call backend). Auth: Bearer <token>.

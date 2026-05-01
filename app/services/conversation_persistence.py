@@ -4,6 +4,90 @@ from __future__ import annotations
 from app.db.supabase_client import get_supabase
 
 
+def consume_user_request_quota(user_id: str, *, max_retries: int = 3) -> int:
+    """
+    Consume one request from the user's quota and return remaining quota.
+
+    Raises:
+    - ValueError("quota_exceeded") if no remaining quota.
+    - RuntimeError on unexpected persistence failures.
+    """
+    ensure_user(user_id)
+    supabase = get_supabase()
+
+    for _ in range(max_retries):
+        r = (
+            supabase.table("users")
+            .select("request_quota_total,request_quota_used")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data if hasattr(r, "data") else []
+        if not rows:
+            raise RuntimeError("User not found after ensure_user")
+        row = dict(rows[0])
+        total = int(row.get("request_quota_total") or 0)
+        used = int(row.get("request_quota_used") or 0)
+        if used >= total:
+            raise ValueError("quota_exceeded")
+
+        next_used = used + 1
+        update_r = (
+            supabase.table("users")
+            .update({"request_quota_used": next_used})
+            .eq("id", user_id)
+            .eq("request_quota_used", used)
+            .execute()
+        )
+        updated_rows = update_r.data if hasattr(update_r, "data") else []
+        if updated_rows:
+            return total - next_used
+
+    raise RuntimeError("Failed to consume quota due to concurrent updates")
+
+
+def get_user_request_quota_remaining(user_id: str) -> int:
+    """Return request_quota_total - request_quota_used for user."""
+    ensure_user(user_id)
+    supabase = get_supabase()
+    r = (
+        supabase.table("users")
+        .select("request_quota_total,request_quota_used")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = r.data if hasattr(r, "data") else []
+    if not rows:
+        return 0
+    row = dict(rows[0])
+    total = int(row.get("request_quota_total") or 0)
+    used = int(row.get("request_quota_used") or 0)
+    return max(total - used, 0)
+
+
+def get_user_request_quota(user_id: str) -> dict:
+    """Return { total, used, remaining } for a user."""
+    ensure_user(user_id)
+    supabase = get_supabase()
+    r = (
+        supabase.table("users")
+        .select("request_quota_total,request_quota_used")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = r.data if hasattr(r, "data") else []
+    if not rows:
+        return {"total": 0, "used": 0, "remaining": 0}
+    row = dict(rows[0])
+    total = int(row.get("request_quota_total") or 0)
+    used = int(row.get("request_quota_used") or 0)
+    remaining = max(total - used, 0)
+    return {"total": total, "used": used, "remaining": remaining}
+
+
 def ensure_user(user_id: str) -> None:
     """Ensure user row exists so we remember every user who contacts us.
     If your users table has NOT NULL columns (e.g. email), we supply placeholders

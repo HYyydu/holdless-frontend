@@ -36,6 +36,13 @@ def _log_openai_key_status() -> None:
             "OPENAI_API_KEY: not set — add it to .env in the project root, or export it before starting the Python backend. "
             "Otherwise simple chat (e.g. 'hello') will show the fallback message."
         )
+    cal_key = os.environ.get("CAL_COM_API_KEY", "").strip()
+    cal_et = os.environ.get("CAL_COM_EVENT_TYPE_ID", "").strip()
+    print(
+        "CAL_COM: "
+        + ("API key set, " if cal_key else "API key not set — ")
+        + ("EVENT_TYPE_ID set" if cal_et else "EVENT_TYPE_ID missing — slots API will be skipped")
+    )
 
 
 app.add_middleware(

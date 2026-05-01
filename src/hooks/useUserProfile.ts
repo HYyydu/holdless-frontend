@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
 
 export interface UserProfile {
-  name: string;
+  firstName: string;
+  lastName: string;
   email: string;
   phone: string;
   address: string;
@@ -15,7 +16,8 @@ export interface UserProfile {
 const STORAGE_KEY = 'holdless_user_profile';
 
 const defaultProfile: UserProfile = {
-  name: '',
+  firstName: '',
+  lastName: '',
   email: '',
   phone: '',
   address: '',
@@ -36,7 +38,19 @@ export function useUserProfile() {
       const stored = localStorage.getItem(STORAGE_KEY);
       if (stored) {
         const parsed = JSON.parse(stored);
-        setProfile({ ...defaultProfile, ...parsed });
+        const legacyName =
+          typeof parsed?.name === 'string' ? parsed.name.trim() : '';
+        const existingFirstName =
+          typeof parsed?.firstName === 'string' ? parsed.firstName.trim() : '';
+        const existingLastName =
+          typeof parsed?.lastName === 'string' ? parsed.lastName.trim() : '';
+        const [legacyFirstName, ...legacyLastParts] = legacyName.split(/\s+/).filter(Boolean);
+        setProfile({
+          ...defaultProfile,
+          ...parsed,
+          firstName: existingFirstName || legacyFirstName || '',
+          lastName: existingLastName || legacyLastParts.join(' '),
+        });
       }
     } catch (error) {
       console.error('Error loading user profile:', error);
@@ -65,7 +79,7 @@ export function useUserProfile() {
 
   // Check if profile has essential info filled for autofill
   const hasEssentialInfo = Boolean(
-    profile.name?.trim() && 
+    profile.firstName?.trim() && 
     profile.dateOfBirth && 
     profile.state?.trim() && 
     profile.zipCode?.trim()

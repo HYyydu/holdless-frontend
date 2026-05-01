@@ -2,9 +2,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { getTasks, createTask, updateTask, type TaskRowFromApi } from '@/lib/chatApi';
 import type { Task } from '@/components/TaskCard';
 import type { CallTask } from '@/components/dashboard/ConversationView';
+import type { TaskAttachment } from '@/lib/taskAttachments';
 
 function rowToTask(row: TaskRowFromApi): Task {
   const p = row.payload || {};
+  const attachments = Array.isArray(p.attachments)
+    ? (p.attachments as TaskAttachment[])
+    : undefined;
   return {
     id: row.id,
     vendor: (p.vendor as string) ?? 'Unknown',
@@ -18,6 +22,8 @@ function rowToTask(row: TaskRowFromApi): Task {
     channel: p.channel as Task['channel'],
     holdTime: p.holdTime as string | undefined,
     transcript: p.transcript as string | undefined,
+    attachments,
+    billDetails: p.billDetails as Task['billDetails'],
     callSummary: p.callSummary as Task['callSummary'],
   };
 }
@@ -62,12 +68,15 @@ export function taskToPayload(task: Omit<Task, 'id'> & { id?: string }): Record<
     channel: task.channel,
     holdTime: task.holdTime,
     transcript: task.transcript,
+    attachments: task.attachments,
+    billDetails: task.billDetails,
     callSummary: task.callSummary,
   };
 }
 
 function callTaskToPayload(task: Omit<CallTask, 'id'> & { id?: string }): Record<string, unknown> {
   return {
+    ...(task.payload ?? {}),
     type: 'call',
     callId: task.callId,
     title: task.title,

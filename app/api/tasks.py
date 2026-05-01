@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from app.services.bill_extraction import extract_bill_fields_from_attachments
 from app.services.task_service import create_task, list_tasks, update_task
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -18,6 +19,11 @@ class CreateTaskBody(BaseModel):
 class UpdateTaskBody(BaseModel):
     status: str | None = None
     payload: dict | None = None
+
+
+class ExtractBillFieldsBody(BaseModel):
+    user_id: str
+    attachments: list[dict]
 
 
 @router.get("")
@@ -62,5 +68,17 @@ def patch_task(
         return row
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/extract-bill-fields")
+def post_extract_bill_fields(body: ExtractBillFieldsBody) -> dict:
+    """Extract bill facts from uploaded image/PDF attachments."""
+    if not body.user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        fields = extract_bill_fields_from_attachments(body.attachments or [])
+        return {"fields": fields}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e

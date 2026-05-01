@@ -7,9 +7,50 @@
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   email TEXT,
+  request_quota_total INTEGER NOT NULL DEFAULT 20,
+  request_quota_used INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'users_request_quota_total_nonnegative'
+  ) THEN
+    ALTER TABLE users
+      ADD CONSTRAINT users_request_quota_total_nonnegative
+      CHECK (request_quota_total >= 0);
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'users_request_quota_used_nonnegative'
+  ) THEN
+    ALTER TABLE users
+      ADD CONSTRAINT users_request_quota_used_nonnegative
+      CHECK (request_quota_used >= 0);
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'users_request_quota_used_lte_total'
+  ) THEN
+    ALTER TABLE users
+      ADD CONSTRAINT users_request_quota_used_lte_total
+      CHECK (request_quota_used <= request_quota_total);
+  END IF;
+END $$;
 
 -- Pet profiles linked to a user
 CREATE TABLE IF NOT EXISTS pet_profiles (
@@ -89,3 +130,62 @@ DROP TRIGGER IF EXISTS tasks_updated_at ON tasks;
 CREATE TRIGGER tasks_updated_at
   BEFORE UPDATE ON tasks
   FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
+
+-- Storage bucket for private task/bill attachments
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+  'task-attachments',
+  'task-attachments',
+  false,
+  10485760,
+  ARRAY['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'application/pdf']
+)
+ON CONFLICT (id) DO UPDATE
+SET
+  public = EXCLUDED.public,
+  file_size_limit = EXCLUDED.file_size_limit,
+  allowed_mime_types = EXCLUDED.allowed_mime_types;
+
+DROP POLICY IF EXISTS "task_attachments_select_own" ON storage.objects;
+CREATE POLICY "task_attachments_select_own"
+ON storage.objects
+FOR SELECT
+TO authenticated
+USING (
+  bucket_id = 'task-attachments'
+  AND split_part(name, '/', 1) = auth.uid()::text
+);
+
+DROP POLICY IF EXISTS "task_attachments_insert_own" ON storage.objects;
+CREATE POLICY "task_attachments_insert_own"
+ON storage.objects
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  bucket_id = 'task-attachments'
+  AND split_part(name, '/', 1) = auth.uid()::text
+);
+
+DROP POLICY IF EXISTS "task_attachments_update_own" ON storage.objects;
+CREATE POLICY "task_attachments_update_own"
+ON storage.objects
+FOR UPDATE
+TO authenticated
+USING (
+  bucket_id = 'task-attachments'
+  AND split_part(name, '/', 1) = auth.uid()::text
+)
+WITH CHECK (
+  bucket_id = 'task-attachments'
+  AND split_part(name, '/', 1) = auth.uid()::text
+);
+
+DROP POLICY IF EXISTS "task_attachments_delete_own" ON storage.objects;
+CREATE POLICY "task_attachments_delete_own"
+ON storage.objects
+FOR DELETE
+TO authenticated
+USING (
+  bucket_id = 'task-attachments'
+  AND split_part(name, '/', 1) = auth.uid()::text
+);

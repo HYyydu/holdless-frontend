@@ -14,10 +14,25 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_BILLING_DISPUTE_HINT_RE = re.compile(
+    r"(fix\s+claim\s+or\s+billing\s+issues?)|"
+    r"(billing\s+issues?)|"
+    r"(bill(?:ing)?\s+(?:issue|problem|dispute|error|wrong|incorrect|overcharge))|"
+    r"(dispute\s+(?:my\s+)?bill)|"
+    r"(insurance\s+adjustment(?:\s+of)?\s+\$?\d[\d,]*(?:\.\d{1,2})?)|"
+    r"((?:extra|additional)\s+charge)|"
+    r"(discount\s+from\s+insurance)|"
+    r"((?:why|confused|explain|understand).{0,80}(?:insurance|adjustment|charge|discount))|"
+    r"(claim\s+(?:and|or)\s+billing)|"
+    r"(账单|账单问题|账单纠纷|理赔|保险理赔)",
+    re.IGNORECASE,
+)
 
 # Execution modes
 EXECUTION_CHAT = "chat"
@@ -161,6 +176,9 @@ def layer1_to_flow_type(route: Layer1Route) -> str | None:
     # call + complaint / retail (return, refund) → return_service
     if route.domain == DOMAIN_RETAIL:
         return FLOW_RETURN_SERVICE
+    # call + complaint / insurance (billing dispute) → general_call with insurance slot schema
+    if route.domain == DOMAIN_INSURANCE and route.capability == CAPABILITY_COMPLAINT:
+        return FLOW_GENERAL_CALL
     # call + pet (e.g. booking, price_quote) → hospital_pet_quote
     if route.domain == DOMAIN_PET:
         return FLOW_HOSPITAL_PET_QUOTE
@@ -183,6 +201,8 @@ def flow_type_for_domain_capability(domain: str, capability: str) -> str | None:
         return FLOW_HOSPITAL_PET_QUOTE
     if domain == DOMAIN_RETAIL:
         return FLOW_RETURN_SERVICE
+    if domain == DOMAIN_INSURANCE and capability == CAPABILITY_COMPLAINT:
+        return FLOW_GENERAL_CALL
     if domain == DOMAIN_GENERAL_BUSINESS and capability == CAPABILITY_PRICE_QUOTE:
         return FLOW_GENERAL_BUSINESS_QUOTE
     if capability == CAPABILITY_INFORMATION_LOOKUP:
@@ -282,6 +302,21 @@ def route_flow(
     msg = (message or "").strip()
     if not msg:
         return None
+
+    # Deterministic fast-path for insurance billing dispute intent to avoid
+    # LLM under-classifying short UI-trigger phrases like
+    # "Fix claim or billing issues" as clarify.
+    if _BILLING_DISPUTE_HINT_RE.search(msg):
+        return Layer1Route(
+            execution_mode=EXECUTION_CALL,
+            capability=CAPABILITY_COMPLAINT,
+            domain=DOMAIN_INSURANCE,
+            confidence=0.95,
+            reasoning="User asks to resolve a claim/billing issue with insurance.",
+            needs_clarification=False,
+            multi_intent=False,
+        )
+
     client = _get_client()
     if not client:
         logger.warning("Flow router: no OpenAI client (OPENAI_API_KEY not set).")

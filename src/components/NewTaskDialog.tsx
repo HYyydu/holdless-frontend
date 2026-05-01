@@ -14,9 +14,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useGovProfiles, GovProfile } from "@/hooks/useGovProfiles";
 import { ProfileSelector } from "@/components/gov-task/ProfileSelector";
 import { GovInfoForm } from "@/components/gov-task/GovInfoForm";
+import { uploadTaskAttachments, validateTaskAttachment, type TaskAttachment } from "@/lib/taskAttachments";
+import { extractBillFields, type ExtractedBillFields } from "@/lib/chatApi";
 
 interface NewTaskDialogProps {
-  onCreateTask: (task: any) => void;
+  onCreateTask: (task: any) => void | Promise<void>;
+  userId?: string | null;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   initialDescription?: string;
@@ -112,7 +115,7 @@ const governmentSubCategories: Record<string, string[]> = {
   "Other / Talk to an Agent": ["Describe your issue"],
 };
 
-export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange, initialDescription }: NewTaskDialogProps) {
+export function NewTaskDialog({ onCreateTask, userId, open: controlledOpen, onOpenChange, initialDescription }: NewTaskDialogProps) {
   const [internalOpen, setInternalOpen] = useState(false);
   
   // Support both controlled and uncontrolled modes
@@ -134,6 +137,13 @@ export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange
   const [outcome, setOutcome] = useState("");
   const [orderNumber, setOrderNumber] = useState("");
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [isCreatingTask, setIsCreatingTask] = useState(false);
+  const [companyProviderName, setCompanyProviderName] = useState("");
+  const [billAmount, setBillAmount] = useState("");
+  const [accountOrInvoiceNumber, setAccountOrInvoiceNumber] = useState("");
+  const [billDueDate, setBillDueDate] = useState("");
+  const [chargeOrServiceDate, setChargeOrServiceDate] = useState("");
   
   // Government service specific fields
   const [govFullName, setGovFullName] = useState("");
@@ -175,20 +185,49 @@ export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange
     "Other / Talk to an Agent": MessageSquare,
   };
 
-  const handleCreateTask = () => {
-    const newTask = {
-      id: Date.now().toString(),
-      vendor,
-      issue: vendor === "Government / Public Services" ? `${issue} - ${subIssue}` : issue,
-      desiredOutcome: vendor === "Government / Public Services" ? govCallGoal : (outcome || undefined),
-      orderNumber: orderNumber || undefined,
-      status: 'pending' as const,
-      createdAt: new Date(),
-      eta: "Starting within 30 minutes"
-    };
-    
-    onCreateTask(newTask);
-    resetForm();
+  const handleCreateTask = async () => {
+    if (isCreatingTask) return;
+    setUploadError(null);
+    setIsCreatingTask(true);
+    try {
+      let attachments: TaskAttachment[] | undefined;
+      if (uploadedFiles.length > 0) {
+        if (!userId) {
+          throw new Error("Please sign in before uploading bill documents.");
+        }
+        attachments = await uploadTaskAttachments(userId, uploadedFiles);
+      }
+      let extractedFields: ExtractedBillFields | null = null;
+      if (userId && attachments && attachments.length > 0) {
+        extractedFields = await extractBillFields(userId, attachments as unknown as Array<Record<string, unknown>>);
+      }
+      const billDetails = {
+        companyProviderName: companyProviderName || extractedFields?.companyProviderName || undefined,
+        billAmount: billAmount || extractedFields?.billAmount || undefined,
+        accountOrInvoiceNumber: accountOrInvoiceNumber || extractedFields?.accountOrInvoiceNumber || undefined,
+        billDueDate: billDueDate || extractedFields?.billDueDate || undefined,
+        chargeOrServiceDate: chargeOrServiceDate || extractedFields?.chargeOrServiceDate || undefined,
+      };
+      const newTask = {
+        id: Date.now().toString(),
+        vendor,
+        issue: vendor === "Government / Public Services" ? `${issue} - ${subIssue}` : issue,
+        desiredOutcome: vendor === "Government / Public Services" ? govCallGoal : (outcome || undefined),
+        orderNumber: orderNumber || undefined,
+        attachments,
+        billDetails,
+        status: 'pending' as const,
+        createdAt: new Date(),
+        eta: "Starting within 30 minutes"
+      };
+      await onCreateTask(newTask);
+      resetForm();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to upload files.";
+      setUploadError(message);
+    } finally {
+      setIsCreatingTask(false);
+    }
   };
 
   const resetForm = () => {
@@ -202,6 +241,11 @@ export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange
     setOutcome("");
     setOrderNumber("");
     setUploadedFiles([]);
+    setCompanyProviderName("");
+    setBillAmount("");
+    setAccountOrInvoiceNumber("");
+    setBillDueDate("");
+    setChargeOrServiceDate("");
     // Reset government fields
     setGovFullName("");
     setGovDateOfBirth("");
@@ -241,11 +285,26 @@ export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
-    setUploadedFiles(prev => [...prev, ...files]);
+    if (files.length === 0) return;
+    const nextFiles: File[] = [];
+    for (const file of files) {
+      const validationError = validateTaskAttachment(file);
+      if (validationError) {
+        setUploadError(validationError);
+        continue;
+      }
+      nextFiles.push(file);
+    }
+    if (nextFiles.length > 0) {
+      setUploadError(null);
+      setUploadedFiles(prev => [...prev, ...nextFiles]);
+    }
+    e.target.value = "";
   };
 
   const removeFile = (index: number) => {
     setUploadedFiles(prev => prev.filter((_, i) => i !== index));
+    setUploadError(null);
   };
 
   // Sync initialDescription when it changes
@@ -517,6 +576,9 @@ export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange
                             ))}
                           </div>
                         )}
+                        {uploadError && (
+                          <p className="text-xs text-destructive">{uploadError}</p>
+                        )}
                       </div>
                     </div>
 
@@ -528,6 +590,34 @@ export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange
                         value={outcome}
                         onChange={(e) => setOutcome(e.target.value)}
                         className="min-h-20"
+                      />
+                    </div>
+                    <div className="space-y-3">
+                      <Label className="text-sm font-medium">Bill Details (auto-filled from uploaded files when you start task)</Label>
+                      <Input
+                        placeholder="Company/provider name"
+                        value={companyProviderName}
+                        onChange={(e) => setCompanyProviderName(e.target.value)}
+                      />
+                      <Input
+                        placeholder="Bill amount"
+                        value={billAmount}
+                        onChange={(e) => setBillAmount(e.target.value)}
+                      />
+                      <Input
+                        placeholder="Account number / invoice number"
+                        value={accountOrInvoiceNumber}
+                        onChange={(e) => setAccountOrInvoiceNumber(e.target.value)}
+                      />
+                      <Input
+                        placeholder="Bill due date"
+                        value={billDueDate}
+                        onChange={(e) => setBillDueDate(e.target.value)}
+                      />
+                      <Input
+                        placeholder="Date of charge/service"
+                        value={chargeOrServiceDate}
+                        onChange={(e) => setChargeOrServiceDate(e.target.value)}
                       />
                     </div>
                   </>
@@ -735,7 +825,7 @@ export function NewTaskDialog({ onCreateTask, open: controlledOpen, onOpenChange
                 <Button variant="outline" onClick={() => setStep(vendor === "Government / Public Services" ? 3 : 2)}>
                   Back
                 </Button>
-                <Button variant="success" onClick={handleCreateTask}>
+                <Button variant="success" onClick={() => { void handleCreateTask(); }} disabled={isCreatingTask}>
                   Start Task
                 </Button>
               </div>

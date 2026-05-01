@@ -70,7 +70,13 @@ def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
 def _normalize_e164(phone: str | None) -> str | None:
     if not phone or not isinstance(phone, str):
         return None
+    # Google phone fields can include extension text ("ext 2"), punctuation, etc.
+    # Keep first NANP-looking sequence so valid US numbers don't get discarded.
     digits = re.sub(r"\D", "", phone.strip())
+    if len(digits) >= 11 and digits.startswith("1"):
+        digits = digits[:11]
+    elif len(digits) > 10:
+        digits = digits[:10]
     if len(digits) == 10:
         return f"+1{digits}"
     if len(digits) == 11 and digits.startswith("1"):
@@ -108,6 +114,49 @@ def _text_search(
         logger.warning("Places text search status=%s msg=%s", status, data.get("error_message"))
         return []
     return list(data.get("results") or [])
+
+
+def search_parking_places(location_query: str, *, limit: int = _RESULTS_CAP) -> list[dict[str, Any]]:
+    """
+    Generic parking search for user-facing "nearby parking" requests.
+    Returns simplified place dicts: name, address, rating, place_id.
+    """
+    q = (location_query or "").strip()
+    if not q or not _api_key():
+        return []
+    # Bias toward monthly parking intent while still allowing generic parking queries.
+    query = f"monthly parking near {q}"
+    requested_limit = max(1, int(limit))
+    # Pull more candidates, then keep only entries with callable phone numbers.
+    raw = _text_search(query, lat=None, lng=None)[: max(requested_limit * 4, 12)]
+    out: list[dict[str, Any]] = []
+    seen_identity: set[str] = set()
+    for p in raw:
+        if len(out) >= requested_limit:
+            break
+        place_id = str(p.get("place_id") or "").strip()
+        details = _place_details(place_id) if place_id else {}
+        intl = details.get("international_phone_number") or details.get("formatted_phone_number")
+        phone = _normalize_e164(intl)
+        if not phone:
+            continue
+        name = p.get("name") or "Parking"
+        address = details.get("formatted_address") or p.get("formatted_address") or ""
+        identity = f"{name.lower()}::{address.lower()}"
+        if identity in seen_identity:
+            continue
+        seen_identity.add(identity)
+        out.append(
+            {
+                "place_id": place_id,
+                "name": name,
+                "address": address,
+                "rating": p.get("rating"),
+                "phone": phone,
+                "open_now": (p.get("opening_hours") or {}).get("open_now"),
+            }
+        )
+    return out
 
 
 def _place_details(place_id: str) -> dict[str, Any]:
@@ -154,14 +203,25 @@ def search_veterinary_clinics_near_zip(zip5: str, *, limit: int = _RESULTS_CAP) 
         return []
 
     lat0, lng0 = lat_lng
-    # Biased search around ZIP; query matches vet / animal hospital intent.
-    raw = _text_search(
-        "veterinary clinic OR animal hospital OR pet hospital",
-        lat=lat0,
-        lng=lng0,
-    )
-    if not raw:
-        raw = _text_search(f"veterinary near {z}", lat=None, lng=None)
+    # Query variations: OR-heavy text queries can be unreliable for Places Text Search.
+    query_plan: list[tuple[str, float | None, float | None]] = [
+        ("veterinary clinic", lat0, lng0),
+        ("animal hospital", lat0, lng0),
+        ("pet hospital", lat0, lng0),
+        (f"veterinary clinic near {z}", None, None),
+    ]
+    deduped_raw: list[dict[str, Any]] = []
+    seen_place_ids: set[str] = set()
+    for q, qlat, qlng in query_plan:
+        for p in _text_search(q, lat=qlat, lng=qlng):
+            pid = str(p.get("place_id") or "").strip()
+            if not pid or pid in seen_place_ids:
+                continue
+            seen_place_ids.add(pid)
+            deduped_raw.append(p)
+        if len(deduped_raw) >= _MAX_CANDIDATES:
+            break
+    raw = deduped_raw
 
     out: list[dict[str, Any]] = []
     for p in raw[:_MAX_CANDIDATES]:
@@ -193,6 +253,100 @@ def search_veterinary_clinics_near_zip(zip5: str, *, limit: int = _RESULTS_CAP) 
                 "clinic_id": pid,
                 "place_id": pid,
                 "name": p.get("name") or det.get("name") or "Veterinary clinic",
+                "rating": rating if rating is not None else 0.0,
+                "distance": dist,
+                "phone": phone,
+                "address": det.get("formatted_address") or p.get("formatted_address"),
+            }
+        )
+    return out
+
+
+def search_human_medical_near_zip(zip5: str, *, limit: int = _RESULTS_CAP) -> list[dict[str, Any]]:
+    """
+    Hospitals / ER / urgent care near a US ZIP (human healthcare, not veterinary).
+    Same shape as search_veterinary_clinics_near_zip for callers.
+    """
+    z = re.sub(r"\D", "", (zip5 or "").strip())
+    if len(z) >= 5:
+        z = z[:5]
+    else:
+        return []
+
+    if not _api_key():
+        return []
+
+    from app.services.geocode import geocode_to_lat_lng
+
+    lat_lng = geocode_to_lat_lng(f"{z}, USA")
+    if not lat_lng:
+        lat_lng = geocode_to_lat_lng(z)
+    lat0: float | None = None
+    lng0: float | None = None
+    if not lat_lng:
+        logger.warning("Could not geocode ZIP %s for hospital Places search; falling back to ZIP text search", z)
+    else:
+        lat0, lng0 = lat_lng
+
+    query_plan: list[tuple[str, float | None, float | None]] = []
+    if lat0 is not None and lng0 is not None:
+        query_plan.extend(
+            [
+                ("hospital", lat0, lng0),
+                ("emergency room", lat0, lng0),
+                ("urgent care", lat0, lng0),
+            ]
+        )
+    query_plan.extend(
+        [
+            (f"hospital near {z}", None, None),
+            (f"urgent care near {z}", None, None),
+            (f"emergency room near {z}", None, None),
+        ]
+    )
+    deduped_raw: list[dict[str, Any]] = []
+    seen_place_ids: set[str] = set()
+    for q, qlat, qlng in query_plan:
+        for p in _text_search(q, lat=qlat, lng=qlng):
+            pid = str(p.get("place_id") or "").strip()
+            if not pid or pid in seen_place_ids:
+                continue
+            seen_place_ids.add(pid)
+            deduped_raw.append(p)
+        if len(deduped_raw) >= _MAX_CANDIDATES:
+            break
+    raw = deduped_raw
+
+    out: list[dict[str, Any]] = []
+    for p in raw[:_MAX_CANDIDATES]:
+        if len(out) >= limit:
+            break
+        pid = p.get("place_id")
+        if not pid:
+            continue
+        det = _place_details(pid)
+        intl = det.get("international_phone_number") or det.get("formatted_phone_number")
+        phone = _normalize_e164(intl)
+        if not phone:
+            continue
+        loc = (p.get("geometry") or {}).get("location") or {}
+        plat = loc.get("lat")
+        plng = loc.get("lng")
+        if plat is not None and plng is not None and lat0 is not None and lng0 is not None:
+            dist = round(_haversine_miles(lat0, lng0, float(plat), float(plng)), 1)
+        else:
+            dist = 0.0
+        rating = p.get("rating")
+        if rating is not None:
+            try:
+                rating = round(float(rating), 1)
+            except (TypeError, ValueError):
+                rating = None
+        out.append(
+            {
+                "clinic_id": pid,
+                "place_id": pid,
+                "name": p.get("name") or det.get("name") or "Hospital",
                 "rating": rating if rating is not None else 0.0,
                 "distance": dist,
                 "phone": phone,

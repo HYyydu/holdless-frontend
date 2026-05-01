@@ -26,10 +26,52 @@ STATUS_READY = "ready"
 
 # Layer 1 may classify vet calls as price_quote or booking; both use the same pet schema.
 _PET_SLOT_CAPABILITIES = frozenset({"price_quote", "booking"})
+_INSURANCE_BILL_REQUIRED_SLOTS = (
+    "company_provider_name",
+    "bill_amount",
+    "account_or_invoice_number",
+    "bill_due_date",
+    "charge_or_service_date",
+)
 
 SLOT_STATE_KEY = "slot_state"
 SLOT_DOMAIN_KEY = "slot_domain"
 SLOT_CAPABILITY_KEY = "slot_capability"
+
+
+def _clean_charge_or_service_date(raw: Any) -> str:
+    """Normalize noisy extracted date strings like '/service is April 28, 2024'."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    s = re.sub(r"^[\s/\\\-:]+", "", s)
+    s = re.sub(
+        r"^(?:date\s+of\s+)?(?:charge|service)\s*(?:date)?\s*(?:is|:)\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"^/service\s+is\s+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" ,.;")
+    return s[:40]
+
+
+def _looks_like_non_outcome_noise(message: str) -> bool:
+    """Detect boilerplate lines that should not fill desired_outcome."""
+    m = (message or "").strip().lower()
+    if not m:
+        return True
+    if "uploaded bill document" in m:
+        return True
+    if m in {
+        "fix claim or billing issues",
+        "fix claim and billing issues",
+        "claim or billing issues",
+    }:
+        return True
+    return False
 
 
 def _slot_state_from_context(context: dict[str, Any]) -> dict[str, Any]:
@@ -159,6 +201,61 @@ def _extract_slots_from_message(
     if "skip" in low and "weight" not in out:
         out["weight"] = ""
 
+    # Insurance billing dispute fields.
+    if domain == "insurance" and capability == "complaint":
+        provider_match = re.search(
+            r"(?:company|provider|insurer|insurance(?:\s+company)?)(?:\s+name)?\s*(?:is|:)\s*([^\n,.;]+)",
+            msg,
+            re.IGNORECASE,
+        )
+        if provider_match:
+            out["company_provider_name"] = provider_match.group(1).strip()[:120]
+
+        amount_match = re.search(
+            r"(?:bill\s+amount|amount(?:\s+due)?|charge(?:\s+amount)?)\s*(?:is|:)?\s*(\$?\s?\d[\d,]*(?:\.\d{1,2})?)",
+            msg,
+            re.IGNORECASE,
+        )
+        if amount_match:
+            out["bill_amount"] = amount_match.group(1).strip()
+
+        account_match = re.search(
+            r"(?:account(?:\s+number)?|invoice(?:\s+number)?|acct)\s*(?:number|no\.?|#)?\s*(?:is|:)?\s*([A-Za-z0-9\-]{4,})",
+            msg,
+            re.IGNORECASE,
+        )
+        if account_match:
+            out["account_or_invoice_number"] = account_match.group(1).strip()[:80]
+
+        due_match = re.search(
+            r"(?:bill\s+due\s+date|due\s+date)\s*(?:is|:)?\s*([A-Za-z0-9,\-/ ]{4,40})",
+            msg,
+            re.IGNORECASE,
+        )
+        if due_match:
+            out["bill_due_date"] = due_match.group(1).strip()[:40]
+
+        service_match = re.search(
+            r"(?:date\s+of\s+(?:charge|service)|charge\s+date|service\s+date)\s*(?:is|:)?\s*([A-Za-z0-9,\-/ ]{4,40})",
+            msg,
+            re.IGNORECASE,
+        )
+        if service_match:
+            cleaned_service_date = _clean_charge_or_service_date(service_match.group(1))
+            if cleaned_service_date:
+                out["charge_or_service_date"] = cleaned_service_date
+
+        outcome_match = re.search(
+            r"(?:desired\s+outcome|outcome|resolution|goal|want)\s*(?:is|:)?\s*([^\n]{6,300})",
+            msg,
+            re.IGNORECASE,
+        )
+        if outcome_match:
+            out["desired_outcome"] = outcome_match.group(1).strip()[:300]
+
+        if re.search(r"\b(upload|uploaded|attach|attached|photo|image|pdf)\b", low) or ".pdf" in low:
+            out["bill_upload"] = True
+
     return out
 
 
@@ -220,6 +317,11 @@ def _missing_required(
         phone_entry = slots.get("phone") or {}
         if phone_entry.get("valid") and phone_entry.get("value"):
             missing = [m for m in missing if m.name != "zip_code"]
+    # Insurance bill dispute: bill upload can replace typing all bill fields.
+    if domain == "insurance" and capability == "complaint":
+        upload_entry = slots.get("bill_upload") or {}
+        if upload_entry.get("valid") and upload_entry.get("value") is True:
+            missing = [m for m in missing if m.name not in _INSURANCE_BILL_REQUIRED_SLOTS]
     return missing
 
 
@@ -283,6 +385,43 @@ def _export_to_context(domain: str, capability: str, slots: dict[str, dict]) -> 
         ctx["phone"] = phone
         ctx["hospital_phone"] = phone
         ctx["call_reason"] = get_val("call_reason") or "Customer return/refund inquiry"
+    elif domain == "insurance" and capability == "complaint":
+        phone = get_val("phone")
+        provider = get_val("company_provider_name")
+        amount = get_val("bill_amount")
+        account = get_val("account_or_invoice_number")
+        due_date = get_val("bill_due_date")
+        charge_date = get_val("charge_or_service_date")
+        desired_outcome = get_val("desired_outcome")
+        uploaded = bool(get_val("bill_upload"))
+
+        reason = "Dispute a billing issue"
+        if provider:
+            reason = f"Dispute a billing issue with {provider}"
+        if desired_outcome:
+            reason = f"{reason} and request: {str(desired_outcome).strip()[:200]}"
+        ctx["call_reason"] = reason
+        if phone:
+            ctx["phone"] = phone
+            ctx["hospital_phone"] = phone
+
+        detail_lines = []
+        if provider:
+            detail_lines.append(f"Company/provider: {provider}")
+        if desired_outcome:
+            detail_lines.append(f"Desired outcome: {desired_outcome}")
+        if amount:
+            detail_lines.append(f"Bill amount: {amount}")
+        if account:
+            detail_lines.append(f"Account/invoice number: {account}")
+        if due_date:
+            detail_lines.append(f"Bill due date: {due_date}")
+        if charge_date:
+            detail_lines.append(f"Date of charge/service: {charge_date}")
+        if uploaded:
+            detail_lines.append("Bill uploaded: photo/PDF provided by user")
+        if detail_lines:
+            ctx["call_details"] = "\n".join(detail_lines)
     return {k: v for k, v in ctx.items() if v is not None}
 
 
@@ -304,7 +443,19 @@ def process(
     slot_state = _slot_state_from_context(context)
     current_slots = slot_state.get("slots") or {}
 
+    current_next_slot, _ = _next_question(schema, current_slots, domain, capability)
     extracted = _extract_slots_from_message(message, domain, capability, schema)
+    # Insurance dispute: when we're explicitly asking desired outcome, accept freeform user intent
+    # unless the input is known boilerplate (quick-action/upload line).
+    if (
+        domain == "insurance"
+        and capability == "complaint"
+        and (current_next_slot is not None and current_next_slot.name == "desired_outcome")
+        and "desired_outcome" not in extracted
+    ):
+        msg = (message or "").strip()
+        if msg and not _looks_like_non_outcome_noise(msg):
+            extracted["desired_outcome"] = msg[:300]
     merged_slots = _validate_and_merge(schema, extracted, current_slots)
 
     if _is_ready(schema, merged_slots, domain, capability):
@@ -323,7 +474,36 @@ def process(
             from app.services.state_machine import _strip_phone_numbers
             raw_reason = merged_slots.get("call_reason", {}).get("value") or "Customer return/refund inquiry"
             purpose = _strip_phone_numbers(raw_reason)[:500]
-            reply = f"I have everything I need.\n\nDescription: {purpose}\n\n• phone: {merged_slots.get('phone', {}).get('value', '')}\n\nShould I proceed with the call? (Yes/No)"
+            reply = f"I have everything I need.\n\nPurpose: {purpose}\n\n• phone: {merged_slots.get('phone', {}).get('value', '')}\n\nShould I proceed with the call? (Yes/No)"
+        elif domain == "insurance" and capability == "complaint":
+            phone = (merged_slots.get("phone") or {}).get("value") or ""
+            provider = (merged_slots.get("company_provider_name") or {}).get("value") or ""
+            amount = (merged_slots.get("bill_amount") or {}).get("value") or ""
+            account = (merged_slots.get("account_or_invoice_number") or {}).get("value") or ""
+            due_date = (merged_slots.get("bill_due_date") or {}).get("value") or ""
+            charge_date = (merged_slots.get("charge_or_service_date") or {}).get("value") or ""
+            desired_outcome = (merged_slots.get("desired_outcome") or {}).get("value") or ""
+            uploaded = bool((merged_slots.get("bill_upload") or {}).get("value"))
+            lines = ["I have your bill dispute details:", ""]
+            if phone:
+                lines.append(f"• Phone: {phone}")
+            if provider:
+                lines.append(f"• Company/provider name: {provider}")
+            if desired_outcome:
+                lines.append(f"• Desired outcome: {desired_outcome}")
+            if amount:
+                lines.append(f"• Bill amount: {amount}")
+            if account:
+                lines.append(f"• Account/invoice number: {account}")
+            if due_date:
+                lines.append(f"• Bill due date: {due_date}")
+            if charge_date:
+                lines.append(f"• Date of charge/service: {charge_date}")
+            if uploaded:
+                lines.append("• Bill upload: provided (photo/PDF)")
+            lines.append("")
+            lines.append("Should I proceed with the call? (Yes/No)")
+            reply = "\n".join(lines)
         else:
             reply = "I have everything I need.\n\n" + "\n".join(summary_parts) + "\n\nShould I proceed with the call? (Yes/No)"
         return updated, reply, STATUS_READY, None, None

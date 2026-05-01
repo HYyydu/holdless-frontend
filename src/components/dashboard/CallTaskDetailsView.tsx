@@ -161,7 +161,8 @@ export function CallTaskDetailsView({ task, onBack, onWatchTranscript, onCallEnd
     typeof task.title === 'string'
       ? task.title.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
       : task.title ?? 'Unknown';
-  const callLabel = task.vendor === 'Phone Call' ? issueType : `${task.vendor} - Billing Department`;
+  const placeName = typeof task.payload?.place_name === 'string' ? task.payload.place_name : '';
+  const callLabel = (placeName || task.vendor || issueType || 'Unknown').trim();
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-[hsl(250_30%_99%)]">

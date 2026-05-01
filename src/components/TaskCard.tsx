@@ -2,6 +2,15 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Clock, Phone, MessageCircle, ExternalLink, AlertCircle } from "lucide-react";
+import type { TaskAttachment } from "@/lib/taskAttachments";
+
+export interface BillDetails {
+  companyProviderName?: string;
+  billAmount?: string;
+  accountOrInvoiceNumber?: string;
+  billDueDate?: string;
+  chargeOrServiceDate?: string;
+}
 
 export interface Task {
   id: string;
@@ -16,6 +25,8 @@ export interface Task {
   channel?: 'call' | 'chat' | 'form' | 'email';
   holdTime?: string;
   transcript?: string;
+  attachments?: TaskAttachment[];
+  billDetails?: BillDetails;
   callSummary?: {
     duration: string;
     holdTime: string;

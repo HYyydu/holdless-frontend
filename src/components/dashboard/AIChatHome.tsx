@@ -11,6 +11,8 @@ import {
 import { getConversations, getConversationMessages, deleteConversation, type ConversationItem, type HistoryMessage } from '@/lib/chatApi';
 import { useDemoAuth } from '@/contexts/DemoAuthContext';
 import { format } from 'date-fns';
+import { uploadTaskAttachments, validateTaskAttachment } from '@/lib/taskAttachments';
+import { extractBillFields, type ChatAttachmentPayload, type ExtractedBillFields } from '@/lib/chatApi';
 
 interface QuickAction {
   icon: typeof FileText;
@@ -21,40 +23,43 @@ interface QuickAction {
 const quickActions: QuickAction[] = [
   {
     icon: FileText,
-    title: 'Get a quote',
-    description: 'Get pricing for various items',
+    title: 'Save on medical costs',
+    description: 'Lower bills and compare prices',
   },
   {
     icon: DollarSign,
-    title: 'Get a refund',
-    description: 'Dispute a charge or recover money',
+    title: 'Understand my insurance',
+    description: 'Check coverage, copays, deductibles',
   },
   {
     icon: XCircle,
-    title: 'Cancel a subscription',
-    description: 'End a service you no longer use',
+    title: 'Fix claim or billing issues',
+    description: 'Dispute denials or incorrect charges',
   },
   {
     icon: Phone,
-    title: 'Fix a billing issue',
-    description: 'Resolve incorrect charges',
+    title: 'Book care for me',
+    description: 'Appointments, referrals, authorizations',
   },
 ];
 
 interface AIChatHomeProps {
-  onStartTask: (description: string) => void;
+  onStartTask: (description: string, options?: { attachments?: ChatAttachmentPayload[] }) => void;
   /** When user selects a conversation from history and clicks Continue */
   onSelectConversationToContinue?: (conversationId: string, messages: { role: string; content: string }[]) => void;
 }
 
 export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AIChatHomeProps) {
   const [inputValue, setInputValue] = useState('');
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachmentPayload[]>([]);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<{ id: string; messages: HistoryMessage[] } | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [hasSpeechSupport, setHasSpeechSupport] = useState(false);
   const recognitionRef = useRef<any | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { user } = useDemoAuth();
   const userId = user?.id ?? 'anonymous';
 
@@ -152,9 +157,13 @@ export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AICh
   };
 
   const handleSubmit = () => {
-    if (inputValue.trim()) {
-      onStartTask(inputValue);
+    const text = inputValue.trim();
+    if (text || pendingAttachments.length > 0) {
+      onStartTask(text || 'Please analyze the uploaded bill attachment.', {
+        attachments: pendingAttachments,
+      });
       setInputValue('');
+      setPendingAttachments([]);
     }
   };
 
@@ -180,6 +189,44 @@ export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AICh
       }
       setIsRecording(false);
     }
+  };
+
+  const handleUploadClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleUploadFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const accepted: File[] = [];
+    for (const file of files) {
+      const validationError = validateTaskAttachment(file);
+      if (validationError) {
+        setUploadError(validationError);
+        continue;
+      }
+      accepted.push(file);
+    }
+    if (accepted.length > 0) {
+      try {
+        const attachments = await uploadTaskAttachments(userId, accepted);
+        const extracted = await extractBillFields(
+          userId,
+          attachments as unknown as Array<Record<string, unknown>>,
+        );
+        const extractedFields: ExtractedBillFields | null = extracted ?? null;
+        const next = attachments.map((item) => ({
+          ...item,
+          extractedFields,
+        }));
+        setPendingAttachments((prev) => [...prev, ...next]);
+        setUploadError(null);
+      } catch (error) {
+        console.warn('Bill upload/extraction failed', error);
+        setUploadError('Upload failed. Please retry with a valid image/PDF.');
+      }
+    }
+    e.target.value = '';
   };
 
   if (selectedConversation) {
@@ -316,6 +363,31 @@ export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AICh
 
         {/* Input area - refined styling */}
         <div className="w-full max-w-2xl mb-10">
+          {pendingAttachments.length > 0 && (
+            <div className="mb-2 rounded-xl border border-[hsl(240_30%_90%)] bg-white p-2">
+              <p className="text-xs text-[hsl(240_15%_55%)] mb-2">Ready to send:</p>
+              <div className="flex flex-wrap gap-2">
+                {pendingAttachments.map((file, idx) => (
+                  <div
+                    key={`${file.path}-${idx}`}
+                    className="flex items-center gap-2 rounded-lg border border-[hsl(240_30%_90%)] px-2 py-1"
+                  >
+                    <span className="text-xs text-[hsl(240_20%_25%)]">{file.fileName}</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPendingAttachments((prev) => prev.filter((_, i) => i !== idx))
+                      }
+                      className="text-xs text-[hsl(240_15%_55%)] hover:text-[hsl(240_20%_25%)]"
+                      aria-label={`Remove ${file.fileName}`}
+                    >
+                      x
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="relative border border-[hsl(240_30%_90%)] rounded-2xl bg-white shadow-sm hover:shadow-md transition-shadow duration-200">
             <Textarea
               placeholder="Upload a bill, screenshot, or describe what you need help with..."
@@ -331,7 +403,19 @@ export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AICh
             />
             {/* Buttons inside input at bottom right */}
             <div className="absolute bottom-4 right-4 flex items-center gap-1.5">
-              <button className="w-9 h-9 flex items-center justify-center text-[hsl(240_15%_55%)] hover:text-[hsl(250_60%_55%)] hover:bg-[hsl(250_60%_97%)] rounded-xl transition-all duration-200">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*,.pdf"
+                multiple
+                className="hidden"
+                onChange={handleUploadFiles}
+              />
+              <button
+                type="button"
+                onClick={handleUploadClick}
+                className="w-9 h-9 flex items-center justify-center text-[hsl(240_15%_55%)] hover:text-[hsl(250_60%_55%)] hover:bg-[hsl(250_60%_97%)] rounded-xl transition-all duration-200"
+              >
                 <Upload className="w-5 h-5" />
               </button>
               <button
@@ -356,6 +440,9 @@ export function AIChatHome({ onStartTask, onSelectConversationToContinue }: AICh
               </button>
             </div>
           </div>
+          {uploadError && (
+            <p className="mt-2 text-xs text-destructive">{uploadError}</p>
+          )}
         </div>
 
         {/* Quick actions */}
