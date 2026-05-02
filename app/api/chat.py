@@ -1293,109 +1293,114 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
         if fallback_phone and fallback_phone not in seen_phones:
             queue_targets.append(fallback_phone)
 
-        if task_id and queue_targets and call_backend_configured():
-            if get_user_request_quota_remaining(user_id) < 1:
-                reply_text = (
-                    f"{reply_text}\n\n"
-                    "You have no call requests left in your Holdless trial. "
-                    "Increase your quota to place outbound calls."
-                )
-            else:
-                auth = resolve_bearer_token(request.headers.get("authorization"))
-                caller_first_name = _resolve_profile_first_name(
-                    persisted_context.get("personal_profile")
-                )
-                call_placement_hints = {
-                    k: v
-                    for k, v in build_call_backend_payload(
-                        queue_targets[0],
-                        call_reason_effective,
-                        additional_instructions=call_additional_instructions or None,
-                        caller_name=caller_first_name or None,
-                    ).items()
-                    if k != "phone_number"
-                }
-                queued_call_ids: list[str] = []
-                selected_by_phone: dict[str, dict] = {}
-                if isinstance(selected, list):
-                    for c in selected:
-                        if not isinstance(c, dict):
-                            continue
-                        p = str(c.get("phone") or "").strip()
-                        if p and p not in selected_by_phone:
-                            selected_by_phone[p] = c
-                for target_phone in queue_targets:
-                    if get_user_request_quota_remaining(user_id) < 1:
-                        break
-                    placement = place_outbound_call(
-                        target_phone,
-                        call_reason_effective,
-                        bearer_token=auth,
-                        additional_instructions=call_additional_instructions or None,
-                        caller_name=caller_first_name or None,
+        # Always attach rich call hints when we have a dial target so the Node proxy can
+        # POST /api/calls with talking_points + agent_prompt even when CALL_BACKEND_URL is
+        # only set on Node (Python would skip outbound placement without its own URL).
+        if task_id and queue_targets:
+            caller_first_name = _resolve_profile_first_name(
+                persisted_context.get("personal_profile")
+            )
+            call_placement_hints = {
+                k: v
+                for k, v in build_call_backend_payload(
+                    queue_targets[0],
+                    call_reason_effective,
+                    additional_instructions=call_additional_instructions or None,
+                    caller_name=caller_first_name or None,
+                ).items()
+                if k != "phone_number"
+            }
+
+            if call_backend_configured():
+                if get_user_request_quota_remaining(user_id) < 1:
+                    reply_text = (
+                        f"{reply_text}\n\n"
+                        "You have no call requests left in your Holdless trial. "
+                        "Increase your quota to place outbound calls."
                     )
-                    if placement.get("callId"):
-                        call_id = str(placement["callId"])
-                        queued_call_ids.append(call_id)
-                        selected_item = selected_by_phone.get(target_phone) or {}
-                        queued_calls.append(
-                            {
-                                "callId": call_id,
-                                "phone": target_phone,
-                                "name": str(selected_item.get("name") or "").strip()
-                                or target_phone,
-                            }
+                else:
+                    auth = resolve_bearer_token(request.headers.get("authorization"))
+                    queued_call_ids: list[str] = []
+                    selected_by_phone: dict[str, dict] = {}
+                    if isinstance(selected, list):
+                        for c in selected:
+                            if not isinstance(c, dict):
+                                continue
+                            p = str(c.get("phone") or "").strip()
+                            if p and p not in selected_by_phone:
+                                selected_by_phone[p] = c
+                    for target_phone in queue_targets:
+                        if get_user_request_quota_remaining(user_id) < 1:
+                            break
+                        placement = place_outbound_call(
+                            target_phone,
+                            call_reason_effective,
+                            bearer_token=auth,
+                            additional_instructions=call_additional_instructions or None,
+                            caller_name=caller_first_name or None,
                         )
-                        if not placed_call_id:
-                            placed_call_id = call_id
-                            placed_call_reason = placement.get("callReason") or call_reason_effective
-                            placed_domain = placement.get("domain") or "unknown"
-                        try:
-                            consume_user_request_quota(user_id)
-                        except ValueError as qe:
-                            if str(qe) != "quota_exceeded":
-                                raise
+                        if placement.get("callId"):
+                            call_id = str(placement["callId"])
+                            queued_call_ids.append(call_id)
+                            selected_item = selected_by_phone.get(target_phone) or {}
+                            queued_calls.append(
+                                {
+                                    "callId": call_id,
+                                    "phone": target_phone,
+                                    "name": str(selected_item.get("name") or "").strip()
+                                    or target_phone,
+                                }
+                            )
+                            if not placed_call_id:
+                                placed_call_id = call_id
+                                placed_call_reason = placement.get("callReason") or call_reason_effective
+                                placed_domain = placement.get("domain") or "unknown"
+                            try:
+                                consume_user_request_quota(user_id)
+                            except ValueError as qe:
+                                if str(qe) != "quota_exceeded":
+                                    raise
+                                print(
+                                    "[Chat] consume quota after successful call: unexpectedly exhausted",
+                                    flush=True,
+                                )
+                            ft_ok = placement.get("free_trial_remaining")
+                            if isinstance(ft_ok, (int, float)):
+                                v = int(ft_ok)
+                                call_trial_remaining_reported = (
+                                    v
+                                    if call_trial_remaining_reported is None
+                                    else min(call_trial_remaining_reported, v)
+                                )
+                        elif placement.get("error"):
                             print(
-                                "[Chat] consume quota after successful call: unexpectedly exhausted",
-                                flush=True,
+                                f"[Chat] placeCall failed for {target_phone}: {placement.get('error')}"
                             )
-                        ft_ok = placement.get("free_trial_remaining")
-                        if isinstance(ft_ok, (int, float)):
-                            v = int(ft_ok)
-                            call_trial_remaining_reported = (
-                                v
-                                if call_trial_remaining_reported is None
-                                else min(call_trial_remaining_reported, v)
+                            ft_err = placement.get("free_trial_remaining")
+                            if isinstance(ft_err, (int, float)):
+                                v = int(ft_err)
+                                call_trial_remaining_reported = (
+                                    v
+                                    if call_trial_remaining_reported is None
+                                    else min(call_trial_remaining_reported, v)
+                                )
+                    if placed_call_id:
+                        try:
+                            update_task(
+                                task_id,
+                                user_id,
+                                payload={
+                                    "type": "call",
+                                    "callId": placed_call_id,
+                                    "queuedCallIds": queued_call_ids,
+                                    "callReason": placed_call_reason,
+                                    "title": placed_domain,
+                                    "description": placed_call_reason,
+                                    "vendor": "Phone Call",
+                                },
                             )
-                    elif placement.get("error"):
-                        print(
-                            f"[Chat] placeCall failed for {target_phone}: {placement.get('error')}"
-                        )
-                        ft_err = placement.get("free_trial_remaining")
-                        if isinstance(ft_err, (int, float)):
-                            v = int(ft_err)
-                            call_trial_remaining_reported = (
-                                v
-                                if call_trial_remaining_reported is None
-                                else min(call_trial_remaining_reported, v)
-                            )
-                if placed_call_id:
-                    try:
-                        update_task(
-                            task_id,
-                            user_id,
-                            payload={
-                                "type": "call",
-                                "callId": placed_call_id,
-                                "queuedCallIds": queued_call_ids,
-                                "callReason": placed_call_reason,
-                                "title": placed_domain,
-                                "description": placed_call_reason,
-                                "vendor": "Phone Call",
-                            },
-                        )
-                    except Exception as patch_err:
-                        print(f"[Chat] Failed to update task with callId: {patch_err}")
+                        except Exception as patch_err:
+                            print(f"[Chat] Failed to update task with callId: {patch_err}")
 
     try:
         append_messages(conversation_id, raw_message, reply_text)
