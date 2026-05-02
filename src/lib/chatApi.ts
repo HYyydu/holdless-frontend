@@ -23,6 +23,8 @@ export interface GetChatResponseOptions {
   callBackendToken?: string | null;
   /** User's first name from Profile tab. Sent so call flows can default to caller first name. */
   profileFirstName?: string | null;
+  /** Holdless user id — when set, a successful place_call decrements request quota on the Python backend. */
+  userId?: string | null;
 }
 
 /**
@@ -42,12 +44,15 @@ export async function getChatResponse(
     messages: ChatMessage[];
     callBackendToken?: string;
     profileFirstName?: string;
+    user_id?: string;
   } = {
     messages,
   };
   if (token) body.callBackendToken = token;
   const profileFirstName = options?.profileFirstName?.trim();
   if (profileFirstName) body.profileFirstName = profileFirstName;
+  const quotaUser = options?.userId?.trim();
+  if (quotaUser) body.user_id = quotaUser;
 
   try {
     const res = await fetch("/api/chat", {
@@ -331,17 +336,22 @@ export async function summarizeCall(
 export async function retryCall(
   callId: string,
   purpose: string,
-  options?: GetCallStatusOptions & { phone_number?: string | null },
+  options?: GetCallStatusOptions & {
+    phone_number?: string | null;
+    userId?: string | null;
+  },
 ): Promise<{ callId: string } | null> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   const token = options?.callBackendToken?.trim();
   if (token) headers.Authorization = `Bearer ${token}`;
-  const body: { callId: string; purpose: string; phone_number?: string } = {
+  const body: { callId: string; purpose: string; phone_number?: string; user_id?: string } = {
     callId,
     purpose: purpose || "",
   };
   if (options?.phone_number != null && options.phone_number !== "")
     body.phone_number = options.phone_number;
+  const uid = options?.userId?.trim();
+  if (uid) body.user_id = uid;
   try {
     const res = await fetch("/api/call/retry", {
       method: "POST",
@@ -589,6 +599,8 @@ export async function sendChatMessage(
   }[];
   free_trial_remaining?: number;
   request_quota_remaining?: number;
+  /** Phone-call trial remaining from the call backend (stricter than chat quota when present). */
+  call_trial_remaining?: number;
   error?: string;
   code?: string;
 } | null> {
@@ -684,6 +696,7 @@ export async function sendChatMessage(
       }[];
       free_trial_remaining?: number;
       request_quota_remaining?: number;
+      call_trial_remaining?: number;
       error?: string;
       code?: string;
     };
@@ -712,6 +725,11 @@ export interface TaskRowFromApi {
 export interface ExtractedBillFields {
   companyProviderName?: string;
   billAmount?: string;
+  /** Labeled invoice / INV on the document */
+  invoiceNumber?: string;
+  /** Labeled account / patient account on the document */
+  accountNumber?: string;
+  /** @deprecated Prefer invoiceNumber + accountNumber when both exist */
   accountOrInvoiceNumber?: string;
   billDueDate?: string;
   chargeOrServiceDate?: string;

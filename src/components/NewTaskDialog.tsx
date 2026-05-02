@@ -201,10 +201,17 @@ export function NewTaskDialog({ onCreateTask, userId, open: controlledOpen, onOp
       if (userId && attachments && attachments.length > 0) {
         extractedFields = await extractBillFields(userId, attachments as unknown as Array<Record<string, unknown>>);
       }
+      const exInv = extractedFields?.invoiceNumber?.trim();
+      const exAcct = extractedFields?.accountNumber?.trim();
       const billDetails = {
         companyProviderName: companyProviderName || extractedFields?.companyProviderName || undefined,
         billAmount: billAmount || extractedFields?.billAmount || undefined,
-        accountOrInvoiceNumber: accountOrInvoiceNumber || extractedFields?.accountOrInvoiceNumber || undefined,
+        invoiceNumber: exInv || undefined,
+        accountNumber: exAcct || undefined,
+        accountOrInvoiceNumber:
+          accountOrInvoiceNumber ||
+          (exInv && exAcct ? `${exInv} / ${exAcct}` : exInv || exAcct || extractedFields?.accountOrInvoiceNumber) ||
+          undefined,
         billDueDate: billDueDate || extractedFields?.billDueDate || undefined,
         chargeOrServiceDate: chargeOrServiceDate || extractedFields?.chargeOrServiceDate || undefined,
       };

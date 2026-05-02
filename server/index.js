@@ -57,6 +57,41 @@ const PYTHON_BACKEND_URL = (
 )
   .trim()
   .replace(/\/+$/, "");
+
+/** Decrement Holdless trial quota after a successful outbound call (Python / Supabase). */
+async function consumeRequestQuotaOnPython(userId) {
+  if (!userId || typeof userId !== "string" || !PYTHON_BACKEND_URL) return null;
+  try {
+    const url = `${PYTHON_BACKEND_URL}/api/users/${encodeURIComponent(userId)}/consume-request-quota`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    const text = await res.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_) {
+      data = {};
+    }
+    if (!res.ok) {
+      console.warn(
+        "[Quota] consume-request-quota failed | status:",
+        res.status,
+        "| body:",
+        text?.slice(0, 200),
+      );
+      return null;
+    }
+    return typeof data.request_quota_remaining === "number"
+      ? data.request_quota_remaining
+      : null;
+  } catch (err) {
+    console.warn("[Quota] consume-request-quota exception:", err?.message);
+    return null;
+  }
+}
+
 function proxyToPython(req, res) {
   const url = PYTHON_BACKEND_URL + req.originalUrl;
   const headers = { ...req.headers, host: undefined };
@@ -138,6 +173,7 @@ if (!serveSpa) {
 app.all("/api/pet-profiles", proxyToPython);
 app.all("/api/pet-profiles/:id", proxyToPython);
 app.get("/api/users/:user_id/request-quota", proxyToPython);
+app.post("/api/users/:user_id/consume-request-quota", proxyToPython);
 app.get("/api/conversations", proxyToPython);
 app.delete("/api/conversations/:id", proxyToPython);
 app.get("/api/conversations/:id/messages", proxyToPython);
@@ -845,7 +881,19 @@ async function placeCallViaBackend(
         errMsg =
           "Call backend not found (404). Set CALL_BACKEND_URL to the URL of the service that places calls (e.g. http://localhost:4000), not the chat server. See SETUP.md.";
       }
-      return { error: errMsg };
+      const callTrialRemaining =
+        typeof data.free_trial_remaining === "number"
+          ? data.free_trial_remaining
+          : undefined;
+      const callTrialCode =
+        typeof data.code === "string" ? data.code : undefined;
+      return {
+        error: errMsg,
+        ...(callTrialRemaining !== undefined
+          ? { free_trial_remaining: callTrialRemaining }
+          : {}),
+        ...(callTrialCode ? { code: callTrialCode } : {}),
+      };
     }
 
     if (!data.call || !data.call.id) {
@@ -1226,8 +1274,19 @@ app.post("/api/chat", async (req, res) => {
                 patchErr?.message,
               );
             }
+            const consumedRem = await consumeRequestQuotaOnPython(userId);
+            if (consumedRem !== null) {
+              data.request_quota_remaining = consumedRem;
+              data.free_trial_remaining = consumedRem;
+            }
           } else if (callResult.error) {
             console.warn("[Chat] placeCall failed:", callResult.error);
+            if (typeof callResult.free_trial_remaining === "number") {
+              data.call_trial_remaining = callResult.free_trial_remaining;
+            }
+            if (callResult.code) {
+              data.call_quota_code = callResult.code;
+            }
           }
         }
         res.status(p.status);
@@ -1284,6 +1343,9 @@ app.post("/api/chat", async (req, res) => {
   const systemContent = profileFirstName
     ? `${SYSTEM_PROMPT}\n\nUSER PROFILE FIRST NAME: The user's first name is "${profileFirstName}". Use this as the default caller name when appropriate. If caller name is missing before a call, ask: "Who am I calling for?" and confirm before placing the call.`
     : SYSTEM_PROMPT;
+
+  const openaiQuotaUserId =
+    typeof req.body?.user_id === "string" ? req.body.user_id.trim() : "";
 
   const openaiMessages = [
     { role: "system", content: systemContent },
@@ -1507,6 +1569,13 @@ app.post("/api/chat", async (req, res) => {
       response.callId = lastCallId;
       if (lastCallReason) response.callReason = lastCallReason;
       if (lastCallDomain) response.domain = lastCallDomain;
+      if (openaiQuotaUserId) {
+        const rem = await consumeRequestQuotaOnPython(openaiQuotaUserId);
+        if (rem !== null) {
+          response.request_quota_remaining = rem;
+          response.free_trial_remaining = rem;
+        }
+      }
     }
     console.log(
       "[Chat] sending response | callId:",
@@ -1694,6 +1763,8 @@ app.post("/api/call/retry", async (req, res) => {
     typeof req.body?.phone_number === "string"
       ? req.body.phone_number.trim()
       : "";
+  const retryUserId =
+    typeof req.body?.user_id === "string" ? req.body.user_id.trim() : "";
   if (!callId || !purpose) {
     return res.status(400).json({
       error: "callId and purpose are required.",
@@ -1727,7 +1798,19 @@ app.post("/api/call/retry", async (req, res) => {
       .status(502)
       .json({ error: "Place call did not return a call ID." });
   }
-  return res.json({ callId: callResult.callId });
+  let retryQuotaRemaining = null;
+  if (retryUserId) {
+    retryQuotaRemaining = await consumeRequestQuotaOnPython(retryUserId);
+  }
+  return res.json({
+    callId: callResult.callId,
+    ...(retryQuotaRemaining !== null
+      ? {
+          request_quota_remaining: retryQuotaRemaining,
+          free_trial_remaining: retryQuotaRemaining,
+        }
+      : {}),
+  });
 });
 
 /**

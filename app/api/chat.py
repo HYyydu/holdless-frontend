@@ -53,6 +53,7 @@ from app.services.return_service_machine import (
 from app.services.state_machine import (
     ConversationState,
     _build_call_summary,
+    _clip_attachment_metadata_from_message,
     is_positive_confirmation,
     transition as hospital_transition,
 )
@@ -67,8 +68,12 @@ from app.services.task_service import create_task, update_task
 
 router = APIRouter()
 
+# Do not use bare \bphone\b — attachment summaries contain "billing phone:" and would falsely
+# trigger direct-call before bill-dispute prefill. Allow "phone 945..." as imperative.
 _DIRECT_CALL_VERB_RE = re.compile(
-    r"\b(call|dial|phone|ring)\b|给.*打电话|拨打",
+    r"\b(call|dial|ring)\b|"
+    r"\bphone\s+[\d\(+]|"
+    r"给.*打电话|拨打",
     re.IGNORECASE,
 )
 _PARKING_QUEUE_PAYLOAD_RE = re.compile(r"^\[\[PARKING_QUEUE\]\]\s*(\{.*\})\s*$", re.DOTALL)
@@ -116,7 +121,14 @@ _INSURANCE_SEARCH_RE = re.compile(
     re.IGNORECASE,
 )
 _BILL_DISPUTE_RE = re.compile(
-    r"(dispute\s+(?:my\s+)?bill|billing\s+issue|bill(?:ing)?\s+problem|账单|争议账单|账单纠纷)",
+    r"(dispute\s+(?:my\s+|this\s+|the\s+|a\s+)?bill|billing\s+issue|bill(?:ing)?\s+problem|账单|争议账单|账单纠纷)",
+    re.IGNORECASE,
+)
+# Bill / balance goals without the word "dispute" (e.g. "try to minimize the cost" + bill image)
+_BILL_COST_OR_NEGOTIATION_RE = re.compile(
+    r"\b(?:minimi[sz]e|reduce|lowering?|lower)\s+(?:the\s+)?(?:cost|amount|charges?|balance|bill)\b|"
+    r"\b(?:waive|negotiate|settle|discount|adjustment|pay\s+less|too\s+high|overcharged)\b|"
+    r"\b(?:get\s+(?:a\s+)?(?:better|lower)\s+(?:rate|price)|work\s+out\s+(?:a\s+)?payment)\b",
     re.IGNORECASE,
 )
 _CAL_BOOKING_INTENT_RE = re.compile(
@@ -570,20 +582,99 @@ class ChatRequest(BaseModel):
 def _summarize_attachment_fields(fields: dict) -> str:
     if not isinstance(fields, dict):
         return ""
-    key_map = {
-        "companyProviderName": "provider",
-        "billAmount": "bill amount",
-        "accountOrInvoiceNumber": "account/invoice",
-        "billDueDate": "due date",
-        "chargeOrServiceDate": "service date",
-        "billingPhoneNumber": "billing phone",
-    }
     parts: list[str] = []
-    for key, label in key_map.items():
+    for key, label in (
+        ("companyProviderName", "provider"),
+        ("billAmount", "bill amount"),
+        ("invoiceNumber", "invoice"),
+        ("accountNumber", "account"),
+        ("accountOrInvoiceNumber", "account/invoice"),
+        ("billDueDate", "due date"),
+        ("chargeOrServiceDate", "service date"),
+        ("billingPhoneNumber", "billing phone"),
+    ):
         value = str(fields.get(key) or "").strip()
-        if value:
-            parts.append(f"{label}: {value}")
+        if not value:
+            continue
+        if key == "accountOrInvoiceNumber" and (
+            str(fields.get("invoiceNumber") or "").strip()
+            or str(fields.get("accountNumber") or "").strip()
+        ):
+            continue
+        parts.append(f"{label}: {value}")
     return "; ".join(parts)
+
+
+def _merge_extracted_bill_fields_from_attachments(attachments: list[dict] | None) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    if not isinstance(attachments, list):
+        return merged
+    keys = (
+        "companyProviderName",
+        "billAmount",
+        "invoiceNumber",
+        "accountNumber",
+        "accountOrInvoiceNumber",
+        "billDueDate",
+        "chargeOrServiceDate",
+        "billingPhoneNumber",
+    )
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        ex = item.get("extractedFields")
+        if not isinstance(ex, dict):
+            continue
+        for k in keys:
+            v = str(ex.get(k) or "").strip()
+            if v and not merged.get(k):
+                merged[k] = v
+    return merged
+
+
+def _bill_dispute_prefill_from_fields(
+    fields: dict[str, str],
+    user_message: str | None = None,
+) -> tuple[str, str]:
+    """Short call purpose (one aim) + structured talking points from OCR; no attachment filenames."""
+    provider = str(fields.get("companyProviderName") or "").strip()
+    if provider:
+        purpose = f"Dispute the bill from {provider}"
+    else:
+        purpose = "Dispute this medical bill"
+    lines: list[str] = []
+    if provider:
+        lines.append(f"Company/provider: {provider}")
+    inv = str(fields.get("invoiceNumber") or "").strip()
+    acct = str(fields.get("accountNumber") or "").strip()
+    legacy = str(fields.get("accountOrInvoiceNumber") or "").strip()
+    if inv:
+        lines.append(f"Invoice number: {inv}")
+    if acct:
+        lines.append(f"Account number: {acct}")
+    if not inv and not acct and legacy:
+        lines.append(f"Account/invoice: {legacy}")
+    for label, key in (
+        ("Bill amount", "billAmount"),
+        ("Bill due date", "billDueDate"),
+        ("Date of charge/service", "chargeOrServiceDate"),
+    ):
+        v = str(fields.get(key) or "").strip()
+        if v:
+            lines.append(f"{label}: {v}")
+
+    um = _clip_attachment_metadata_from_message((user_message or "").strip())
+    if um:
+        low = um.lower()
+        if re.search(
+            r"\b(minimi[sz]e|reduce|lowering?|lower)\s+(the\s+)?(cost|amount|charges?|balance)\b",
+            low,
+        ) or re.search(r"\b(waive|negotiate|settle|discount|adjustment)\b", low):
+            purpose = f"{purpose} and try to minimize the cost"
+        lines.append(f"Caller request: {um}")
+
+    details = "\n".join(lines) if lines else ""
+    return purpose, details
 
 
 def _build_attachment_context(attachments: list[dict] | None) -> tuple[str, str | None]:
@@ -701,25 +792,6 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     personal_profile = body.personal_profile if isinstance(body.personal_profile, dict) else None
 
     ensure_user(user_id)
-    try:
-        request_quota_remaining = consume_user_request_quota(user_id)
-    except ValueError as e:
-        if str(e) == "quota_exceeded":
-            remaining = get_user_request_quota_remaining(user_id)
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error": "Request quota exceeded. Please increase your quota.",
-                    "code": "quota_exceeded",
-                    "request_quota_remaining": remaining,
-                },
-            )
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Failed to consume request quota: {e!s}",
-        )
 
     conv = load(conversation_id) if conversation_id else None
     if not conv:
@@ -762,9 +834,38 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     # Deterministic hybrid: if we previously showed "Would you like me to call?" and user confirms,
     # start the slot engine directly without re-running Layer 1 (avoids Layer 1 re-classifying "yes" as chat).
     new_state, updated_context, reply_text, ui_options = None, None, None, None
-    # Deterministic direct-call entry: if user clearly provides "call + phone number", bypass Layer 1.
+
+    # Bill dispute / cost negotiation + billing phone from OCR — MUST run before direct-call:
+    # attachment context includes the substring "billing phone:" which used to match \bphone\b
+    # and skip prefill, yielding "What message should I deliver?".
+    _bill_fast_path_intent = _BILL_DISPUTE_RE.search(raw_message or "") or _BILL_COST_OR_NEGOTIATION_RE.search(
+        raw_message or ""
+    )
     if (
         at_entry_no_flow
+        and _bill_fast_path_intent
+        and extracted_billing_phone
+    ):
+        context["flow_type"] = FLOW_GENERAL_CALL
+        original_block = raw_message.strip()
+        merged_bill = _merge_extracted_bill_fields_from_attachments(body.attachments)
+        pre_reason, pre_details = _bill_dispute_prefill_from_fields(merged_bill, original_block)
+        context["bill_dispute_prefill"] = {
+            "call_reason": pre_reason,
+            "call_details": pre_details,
+        }
+        combined_message = (
+            f"Please call {extracted_billing_phone} and help me dispute this bill.\n\n"
+            f"{original_block}"
+        ).strip()
+        new_state, updated_context, reply_text, ui_options = return_transition(
+            ReturnFlowState.AWAITING_PHONE_OR_ZIP, combined_message, context
+        )
+
+    # Deterministic direct-call entry: if user clearly provides "call + phone number", bypass Layer 1.
+    if (
+        new_state is None
+        and at_entry_no_flow
         and _normalize_phone(message)
         and _DIRECT_CALL_VERB_RE.search(message or "")
     ):
@@ -814,20 +915,6 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 new_state, updated_context, reply_text, ui_options = return_transition(
                     return_state, combined_message, context
                 )
-
-    if (
-        new_state is None
-        and at_entry_no_flow
-        and _BILL_DISPUTE_RE.search(raw_message or "")
-        and extracted_billing_phone
-    ):
-        context["flow_type"] = FLOW_GENERAL_CALL
-        combined_message = (
-            f"Please call {extracted_billing_phone} and dispute my bill based on the uploaded bill details."
-        )
-        new_state, updated_context, reply_text, ui_options = return_transition(
-            ReturnFlowState.AWAITING_PHONE_OR_ZIP, combined_message, context
-        )
 
     if new_state is None and at_entry_no_flow:
         queue_payload = _parse_parking_queue_payload(message)
@@ -1137,7 +1224,6 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     new_state_value = new_state.value if hasattr(new_state, "value") else new_state
     try:
         update_conversation(conversation_id, new_state_value, persisted_context)
-        append_messages(conversation_id, raw_message, reply_text)
     except Exception as e:
         raise HTTPException(
             status_code=503,
@@ -1151,6 +1237,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     queued_calls: list[dict[str, str]] = []
     call_reason_effective: str | None = None
     call_placement_hints = None
+    call_trial_remaining_reported: int | None = None
     is_confirmed = new_state_value in (
         ConversationState.CONFIRMED.value,
         ReturnFlowState.CONFIRMED.value,
@@ -1207,73 +1294,118 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             queue_targets.append(fallback_phone)
 
         if task_id and queue_targets and call_backend_configured():
-            auth = resolve_bearer_token(request.headers.get("authorization"))
-            caller_first_name = _resolve_profile_first_name(
-                persisted_context.get("personal_profile")
-            )
-            call_placement_hints = {
-                k: v
-                for k, v in build_call_backend_payload(
-                    queue_targets[0],
-                    call_reason_effective,
-                    additional_instructions=call_additional_instructions or None,
-                    caller_name=caller_first_name or None,
-                ).items()
-                if k != "phone_number"
-            }
-            queued_call_ids: list[str] = []
-            selected_by_phone: dict[str, dict] = {}
-            if isinstance(selected, list):
-                for c in selected:
-                    if not isinstance(c, dict):
-                        continue
-                    p = str(c.get("phone") or "").strip()
-                    if p and p not in selected_by_phone:
-                        selected_by_phone[p] = c
-            for target_phone in queue_targets:
-                placement = place_outbound_call(
-                    target_phone,
-                    call_reason_effective,
-                    bearer_token=auth,
-                    additional_instructions=call_additional_instructions or None,
-                    caller_name=caller_first_name or None,
+            if get_user_request_quota_remaining(user_id) < 1:
+                reply_text = (
+                    f"{reply_text}\n\n"
+                    "You have no call requests left in your Holdless trial. "
+                    "Increase your quota to place outbound calls."
                 )
-                if placement.get("callId"):
-                    call_id = str(placement["callId"])
-                    queued_call_ids.append(call_id)
-                    selected_item = selected_by_phone.get(target_phone) or {}
-                    queued_calls.append(
-                        {
-                            "callId": call_id,
-                            "phone": target_phone,
-                            "name": str(selected_item.get("name") or "").strip()
-                            or target_phone,
-                        }
+            else:
+                auth = resolve_bearer_token(request.headers.get("authorization"))
+                caller_first_name = _resolve_profile_first_name(
+                    persisted_context.get("personal_profile")
+                )
+                call_placement_hints = {
+                    k: v
+                    for k, v in build_call_backend_payload(
+                        queue_targets[0],
+                        call_reason_effective,
+                        additional_instructions=call_additional_instructions or None,
+                        caller_name=caller_first_name or None,
+                    ).items()
+                    if k != "phone_number"
+                }
+                queued_call_ids: list[str] = []
+                selected_by_phone: dict[str, dict] = {}
+                if isinstance(selected, list):
+                    for c in selected:
+                        if not isinstance(c, dict):
+                            continue
+                        p = str(c.get("phone") or "").strip()
+                        if p and p not in selected_by_phone:
+                            selected_by_phone[p] = c
+                for target_phone in queue_targets:
+                    if get_user_request_quota_remaining(user_id) < 1:
+                        break
+                    placement = place_outbound_call(
+                        target_phone,
+                        call_reason_effective,
+                        bearer_token=auth,
+                        additional_instructions=call_additional_instructions or None,
+                        caller_name=caller_first_name or None,
                     )
-                    if not placed_call_id:
-                        placed_call_id = call_id
-                        placed_call_reason = placement.get("callReason") or call_reason_effective
-                        placed_domain = placement.get("domain") or "unknown"
-                elif placement.get("error"):
-                    print(f"[Chat] placeCall failed for {target_phone}: {placement.get('error')}")
-            if placed_call_id:
-                try:
-                    update_task(
-                        task_id,
-                        user_id,
-                        payload={
-                            "type": "call",
-                            "callId": placed_call_id,
-                            "queuedCallIds": queued_call_ids,
-                            "callReason": placed_call_reason,
-                            "title": placed_domain,
-                            "description": placed_call_reason,
-                            "vendor": "Phone Call",
-                        },
-                    )
-                except Exception as patch_err:
-                    print(f"[Chat] Failed to update task with callId: {patch_err}")
+                    if placement.get("callId"):
+                        call_id = str(placement["callId"])
+                        queued_call_ids.append(call_id)
+                        selected_item = selected_by_phone.get(target_phone) or {}
+                        queued_calls.append(
+                            {
+                                "callId": call_id,
+                                "phone": target_phone,
+                                "name": str(selected_item.get("name") or "").strip()
+                                or target_phone,
+                            }
+                        )
+                        if not placed_call_id:
+                            placed_call_id = call_id
+                            placed_call_reason = placement.get("callReason") or call_reason_effective
+                            placed_domain = placement.get("domain") or "unknown"
+                        try:
+                            consume_user_request_quota(user_id)
+                        except ValueError as qe:
+                            if str(qe) != "quota_exceeded":
+                                raise
+                            print(
+                                "[Chat] consume quota after successful call: unexpectedly exhausted",
+                                flush=True,
+                            )
+                        ft_ok = placement.get("free_trial_remaining")
+                        if isinstance(ft_ok, (int, float)):
+                            v = int(ft_ok)
+                            call_trial_remaining_reported = (
+                                v
+                                if call_trial_remaining_reported is None
+                                else min(call_trial_remaining_reported, v)
+                            )
+                    elif placement.get("error"):
+                        print(
+                            f"[Chat] placeCall failed for {target_phone}: {placement.get('error')}"
+                        )
+                        ft_err = placement.get("free_trial_remaining")
+                        if isinstance(ft_err, (int, float)):
+                            v = int(ft_err)
+                            call_trial_remaining_reported = (
+                                v
+                                if call_trial_remaining_reported is None
+                                else min(call_trial_remaining_reported, v)
+                            )
+                if placed_call_id:
+                    try:
+                        update_task(
+                            task_id,
+                            user_id,
+                            payload={
+                                "type": "call",
+                                "callId": placed_call_id,
+                                "queuedCallIds": queued_call_ids,
+                                "callReason": placed_call_reason,
+                                "title": placed_domain,
+                                "description": placed_call_reason,
+                                "vendor": "Phone Call",
+                            },
+                        )
+                    except Exception as patch_err:
+                        print(f"[Chat] Failed to update task with callId: {patch_err}")
 
+    try:
+        append_messages(conversation_id, raw_message, reply_text)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to persist chat messages: {e!s}",
+        )
+
+    request_quota_remaining = get_user_request_quota_remaining(user_id)
     result = {
         "reply_text": reply_text,
         "conversation_id": conversation_id,
@@ -1282,6 +1414,8 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
         # Keep this alias for existing UI hooks until renamed.
         "free_trial_remaining": request_quota_remaining,
     }
+    if call_trial_remaining_reported is not None:
+        result["call_trial_remaining"] = call_trial_remaining_reported
     if ui_options is not None:
         result["ui_options"] = ui_options
     if task_id is not None:
@@ -1326,6 +1460,36 @@ def get_request_quota(user_id: str) -> dict:
             "request_quota_used": quota["used"],
             "request_quota_remaining": quota["remaining"],
         }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.post("/users/{user_id}/consume-request-quota")
+def post_consume_request_quota(user_id: str) -> dict:
+    """Consume one call-slot from the user's trial (server-to-server after a successful outbound call)."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        remaining = consume_user_request_quota(user_id)
+        quota = get_user_request_quota(user_id)
+        return {
+            "user_id": user_id,
+            "request_quota_remaining": remaining,
+            "request_quota_total": quota["total"],
+            "request_quota_used": quota["used"],
+        }
+    except ValueError as e:
+        if str(e) == "quota_exceeded":
+            rem = get_user_request_quota_remaining(user_id)
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "Request quota exceeded. Please increase your quota.",
+                    "code": "quota_exceeded",
+                    "request_quota_remaining": rem,
+                },
+            )
+        raise
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 

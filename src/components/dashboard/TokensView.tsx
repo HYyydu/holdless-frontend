@@ -238,21 +238,21 @@ export function TokensView({
   const resetsInDays = Math.max(0, differenceInCalendarDays(endOfMonth(now), now));
 
   const maxDayCalls = Math.max(1, ...requestSparkData.map((d) => d.count));
-  const estimatedTrialRemaining = Math.max(0, freeTrialLimit - callTasks.length);
-  const visibleTrialRemaining =
-    typeof freeTrialRemaining === "number" ? Math.max(0, freeTrialRemaining) : estimatedTrialRemaining;
+  /** Rough fallback before quota loads: local call-task rows vs cap (server count is authoritative). */
+  const estimatedCallSlotsRemaining = Math.max(0, freeTrialLimit - callTasks.length);
+  const visibleCallSlotsRemaining =
+    typeof freeTrialRemaining === "number"
+      ? Math.max(0, freeTrialRemaining)
+      : estimatedCallSlotsRemaining;
 
   return (
     <div className="flex-1 overflow-y-auto bg-[hsl(250_25%_98%)]">
       <div className="max-w-6xl mx-auto w-full px-6 py-8 space-y-8">
         {/* All-time total — sum of every call’s consumption */}
         <div className="rounded-2xl border border-border/60 bg-card px-6 py-5 shadow-sm">
-          <p className="text-sm font-medium text-muted-foreground">Free trial requests remaining</p>
+          <p className="text-sm font-medium text-muted-foreground">Outbound call trial — remaining</p>
           <p className="mt-1 text-3xl font-semibold tabular-nums tracking-tight text-foreground">
-            {visibleTrialRemaining.toLocaleString()} / {freeTrialLimit.toLocaleString()}
-          </p>
-          <p className="mt-2 text-sm text-muted-foreground">
-            Uses backend value after a successful call; otherwise estimated from total call requests.
+            {visibleCallSlotsRemaining.toLocaleString()} / {freeTrialLimit.toLocaleString()}
           </p>
         </div>
 

@@ -10,6 +10,7 @@ import {
   type ChatPersonalProfilePayload,
   type ExtractedBillFields,
 } from "@/lib/chatApi";
+import { callTrialRemainingFromChatResponse } from "@/lib/callTrialDisplay";
 import { useDemoAuth } from "@/contexts/DemoAuthContext";
 import { useCallBackendAuth } from "@/contexts/CallBackendAuthContext";
 import { useUserProfile } from "@/hooks/useUserProfile";
@@ -283,6 +284,7 @@ export function ConversationView({
   const chatOpts = {
     callBackendToken: callBackendToken ?? undefined,
     profileFirstName: resolvedFirstName,
+    userId: user?.id ?? undefined,
   };
   const personalProfilePayload: ChatPersonalProfilePayload = {
     firstName: resolvedFirstName,
@@ -803,9 +805,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
       setMessages((prev) => [...prev, assistantMessage]);
       setIsThinking(false);
       setThinkingSteps(null);
-      if (typeof data?.free_trial_remaining === "number") {
-        onFreeTrialRemainingChange?.(data.free_trial_remaining);
-      }
+      const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+      if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
       emitCallTasksFromResponse(data, buttonLabel);
       return;
     }
@@ -883,9 +884,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
       setMessages((prev) => [...prev, assistantMessage]);
       setIsThinking(false);
       setThinkingSteps(null);
-      if (typeof data?.free_trial_remaining === "number") {
-        onFreeTrialRemainingChange?.(data.free_trial_remaining);
-      }
+      const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+      if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
       emitCallTasksFromResponse(data, composedText);
       return;
     }
@@ -1243,9 +1243,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, assistantMessage]);
     setIsThinking(false);
     setThinkingSteps(null);
-    if (typeof data?.free_trial_remaining === "number") {
-      onFreeTrialRemainingChange?.(data.free_trial_remaining);
-    }
+    const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+    if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
     emitCallTasksFromResponse(data, callReason);
   };
   const handleSendParkingCall = async (opt: ParkingOption) => {
@@ -1282,9 +1281,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, assistantMessage]);
     setIsThinking(false);
     setThinkingSteps(null);
-    if (typeof data?.free_trial_remaining === "number") {
-      onFreeTrialRemainingChange?.(data.free_trial_remaining);
-    }
+    const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+    if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
     emitCallTasksFromResponse(data, callPrompt);
   };
 
@@ -1326,9 +1324,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, assistantMessage]);
     setIsThinking(false);
     setThinkingSteps(null);
-    if (typeof data?.free_trial_remaining === "number") {
-      onFreeTrialRemainingChange?.(data.free_trial_remaining);
-    }
+    const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+    if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
     emitCallTasksFromResponse(data, newUserMessage.content);
   };
 

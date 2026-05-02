@@ -11,6 +11,17 @@ from typing import Any
 from app.services.language_bridge import purpose_to_english_for_call_api
 from app.services.state_machine import PURPOSE_MAX_LENGTH, _strip_phone_numbers
 
+# Match app/api/chat.py slice on call_details so confirmation bullets and payload stay aligned.
+CALL_ADDITIONAL_INSTRUCTIONS_MAX = 2000
+_MAX_TALKING_POINT_CHUNKS = 24
+_MAX_TALKING_POINTS_AFTER_PRIORITIZE = 24
+_PER_POINT_MAX_LEN = 220
+# Call backend merges instruction text (purpose + additional + opening line + agent_prompt, etc.) and
+# sanitizes the combined blob (~16k). Size agent_prompt so typical payloads stay under that budget.
+CALL_BACKEND_MERGED_INSTRUCTIONS_MAX = 16000
+MERGED_INSTRUCTIONS_RESERVE = 800
+_AGENT_PROMPT_FIELD_CEILING = 16000
+
 
 def call_backend_configured() -> bool:
     return bool((os.environ.get("CALL_BACKEND_URL") or "").strip())
@@ -49,8 +60,8 @@ def _build_talking_points(details: str, *, fallback_purpose: str) -> list[str]:
         if key in seen:
             continue
         seen.add(key)
-        points.append(item[:180])
-        if len(points) >= 8:
+        points.append(item[:_PER_POINT_MAX_LEN])
+        if len(points) >= _MAX_TALKING_POINT_CHUNKS:
             break
     return points
 
@@ -71,7 +82,7 @@ def _to_first_person(text: str) -> str:
 
 
 def _prioritize_talking_points(points: list[str]) -> list[str]:
-    """Keep points useful for opening; avoid unsolicited detail dumping."""
+    """Normalize wording; preserve all distinct points (same bullets users see at confirm)."""
     prioritized: list[str] = []
     for p in points:
         p = re.sub(
@@ -81,7 +92,7 @@ def _prioritize_talking_points(points: list[str]) -> list[str]:
             flags=re.IGNORECASE,
         ).strip()
         low = p.lower()
-        # Keep core identity + desired outcome + amount/account.
+        # Surface high-signal dispute fields first, then the rest (no drops).
         if any(
             k in low
             for k in (
@@ -89,15 +100,14 @@ def _prioritize_talking_points(points: list[str]) -> list[str]:
                 "desired outcome",
                 "bill amount",
                 "account/invoice",
+                "invoice number",
+                "account number",
             )
         ):
             prioritized.append(p)
             continue
-        # Keep date fields only as reference and not in the primary talking points.
-        if "bill due date" in low or "date of charge/service" in low:
-            continue
         prioritized.append(p)
-    return prioritized[:6]
+    return prioritized[:_MAX_TALKING_POINTS_AFTER_PRIORITIZE]
 
 
 def _build_opening_line(purpose: str, caller_name: str | None = None) -> str:
@@ -200,7 +210,27 @@ def _build_agent_prompt(purpose: str, talking_points: list[str]) -> str:
         lines.append("Talking points:")
         for p in points:
             lines.append(f"- {p}")
-    return "\n".join(lines)[:1500]
+    return "\n".join(lines)
+
+
+def _agent_prompt_char_cap(
+    *,
+    objective: str,
+    additional_field: str,
+    opening_line: str,
+    talking_points: list[str],
+) -> int:
+    """Room left for agent_prompt given call backend merged-instruction sanitize cap."""
+    tp_chars = sum(len(p) for p in talking_points) + max(0, len(talking_points)) * 4
+    pre = (
+        len(objective)
+        + len(additional_field)
+        + len(opening_line)
+        + tp_chars
+        + MERGED_INSTRUCTIONS_RESERVE
+    )
+    room = CALL_BACKEND_MERGED_INSTRUCTIONS_MAX - pre
+    return min(_AGENT_PROMPT_FIELD_CEILING, max(256, room))
 
 
 def build_call_backend_payload(
@@ -219,24 +249,33 @@ def build_call_backend_payload(
     purpose = purpose_to_english_for_call_api(purpose) or purpose
 
     caller = (caller_name or "").strip() or "Holdless"
-    extra = (additional_instructions or "").strip()
-    trimmed_extra = extra[:500] if extra else ""
-    guidance_text = trimmed_extra or purpose
+    extra = (additional_instructions or "").strip()[:CALL_ADDITIONAL_INSTRUCTIONS_MAX]
+    # Confirmation shows Purpose plus bullets from call_details; include both so chunks match the UI.
+    combined_for_points = "\n".join(x for x in (purpose.strip(), extra) if x).strip()
     talking_points = _build_talking_points(
-        guidance_text,
+        combined_for_points,
         fallback_purpose=purpose,
     )
     talking_points = _prioritize_talking_points(talking_points)
     objective = _derive_objective(purpose, talking_points)
     objective = objective[:PURPOSE_MAX_LENGTH]
+    additional_field = extra if extra else purpose[:CALL_ADDITIONAL_INSTRUCTIONS_MAX]
+    opening_line = _build_opening_line(objective, caller)
+    prompt_cap = _agent_prompt_char_cap(
+        objective=objective,
+        additional_field=additional_field,
+        opening_line=opening_line,
+        talking_points=talking_points,
+    )
+    agent_prompt = _build_agent_prompt(objective, talking_points)[:prompt_cap]
     return {
         "phone_number": phone_e164,
         "purpose": objective,
         "name": caller,
-        "additional_instructions": guidance_text[:500],
-        "opening_line": _build_opening_line(objective, caller),
+        "additional_instructions": additional_field,
+        "opening_line": opening_line,
         "talking_points": talking_points,
-        "agent_prompt": _build_agent_prompt(objective, talking_points),
+        "agent_prompt": agent_prompt,
         "call_brief": {
             "objective": objective,
             "talking_points": talking_points,
@@ -318,7 +357,14 @@ def place_outbound_call(
         except json.JSONDecodeError:
             err_data = {}
         msg = err_data.get("error") or err_data.get("message") or raw or f"HTTP {e.code}"
-        return {"error": str(msg)}
+        out: dict[str, Any] = {"error": str(msg)}
+        ft = err_data.get("free_trial_remaining")
+        if isinstance(ft, (int, float)):
+            out["free_trial_remaining"] = int(ft)
+        code = err_data.get("code")
+        if isinstance(code, str) and code.strip():
+            out["code"] = code.strip()
+        return out
     except Exception as e:
         return {"error": str(e)}
 
@@ -328,8 +374,12 @@ def place_outbound_call(
         msg = data.get("message") if isinstance(data, dict) else None
         return {"error": str(msg or "Call backend did not return a call id.")}
 
-    return {
+    out_ok: dict[str, Any] = {
         "callId": cid,
         "callReason": call.get("purpose") or purpose,
         "domain": "unknown",
     }
+    ft_ok = data.get("free_trial_remaining") if isinstance(data, dict) else None
+    if isinstance(ft_ok, (int, float)):
+        out_ok["free_trial_remaining"] = int(ft_ok)
+    return out_ok

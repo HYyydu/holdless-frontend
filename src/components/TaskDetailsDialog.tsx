@@ -244,7 +244,17 @@ export function TaskDetailsDialog({ task, open, onOpenChange }: TaskDetailsDialo
                     <label className="text-sm font-medium text-muted-foreground">Bill Details</label>
                     {task.billDetails.companyProviderName && <p className="text-sm"><strong>Provider:</strong> {task.billDetails.companyProviderName}</p>}
                     {task.billDetails.billAmount && <p className="text-sm"><strong>Amount:</strong> {task.billDetails.billAmount}</p>}
-                    {task.billDetails.accountOrInvoiceNumber && <p className="text-sm"><strong>Account/Invoice:</strong> {task.billDetails.accountOrInvoiceNumber}</p>}
+                    {task.billDetails.invoiceNumber && (
+                      <p className="text-sm"><strong>Invoice:</strong> {task.billDetails.invoiceNumber}</p>
+                    )}
+                    {task.billDetails.accountNumber && (
+                      <p className="text-sm"><strong>Account:</strong> {task.billDetails.accountNumber}</p>
+                    )}
+                    {task.billDetails.accountOrInvoiceNumber &&
+                      !task.billDetails.invoiceNumber &&
+                      !task.billDetails.accountNumber && (
+                        <p className="text-sm"><strong>Account/Invoice:</strong> {task.billDetails.accountOrInvoiceNumber}</p>
+                      )}
                     {task.billDetails.billDueDate && <p className="text-sm"><strong>Due Date:</strong> {task.billDetails.billDueDate}</p>}
                     {task.billDetails.chargeOrServiceDate && <p className="text-sm"><strong>Service Date:</strong> {task.billDetails.chargeOrServiceDate}</p>}
                   </div>

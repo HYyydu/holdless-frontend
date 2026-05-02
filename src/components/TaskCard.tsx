@@ -7,6 +7,8 @@ import type { TaskAttachment } from "@/lib/taskAttachments";
 export interface BillDetails {
   companyProviderName?: string;
   billAmount?: string;
+  invoiceNumber?: string;
+  accountNumber?: string;
   accountOrInvoiceNumber?: string;
   billDueDate?: string;
   chargeOrServiceDate?: string;

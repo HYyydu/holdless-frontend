@@ -22,6 +22,7 @@ import { useTasks, taskToPayload } from '@/hooks/useTasks';
 import { useDemoAuth } from '@/contexts/DemoAuthContext';
 import { useCallBackendAuth } from '@/contexts/CallBackendAuthContext';
 import { summarizeCall, retryCall, getCallStatusWithMeta, getUserRequestQuota, type ChatAttachmentPayload } from '@/lib/chatApi';
+import { mergeHoldlessCallSlotsWithPhoneTrial, readStoredCallTrialRemaining } from '@/lib/callTrialDisplay';
 import { createCallTokenPatchBatcher } from '@/lib/callTokenPatchBatcher';
 import { useCallUsageSocket } from '@/hooks/useCallUsageSocket';
 
@@ -133,7 +134,7 @@ const Dashboard = () => {
 
   useEffect(() => {
     let cancelled = false;
-    const loadRequestQuota = async () => {
+    void (async () => {
       if (!userId) {
         setFreeTrialRemaining(null);
         setFreeTrialLimit(null);
@@ -141,14 +142,33 @@ const Dashboard = () => {
       }
       const quota = await getUserRequestQuota(userId);
       if (!quota || cancelled) return;
-      setFreeTrialRemaining(quota.request_quota_remaining);
+      const storedCallTrial = readStoredCallTrialRemaining(userId);
+      setFreeTrialRemaining(
+        mergeHoldlessCallSlotsWithPhoneTrial(quota.request_quota_remaining, storedCallTrial),
+      );
       setFreeTrialLimit(quota.request_quota_total);
-    };
-    void loadRequestQuota();
+    })();
     return () => {
       cancelled = true;
     };
   }, [userId]);
+
+  useEffect(() => {
+    if (activeTab !== 'tokens' || !userId) return;
+    let cancelled = false;
+    void (async () => {
+      const quota = await getUserRequestQuota(userId);
+      if (!quota || cancelled) return;
+      const storedCallTrial = readStoredCallTrialRemaining(userId);
+      setFreeTrialRemaining(
+        mergeHoldlessCallSlotsWithPhoneTrial(quota.request_quota_remaining, storedCallTrial),
+      );
+      setFreeTrialLimit(quota.request_quota_total);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, userId]);
 
   // Use task from callTasks when available so status updates (e.g. after call_ended) reflect in Task Details
   const effectiveSelectedCallTask = useMemo(
@@ -356,6 +376,7 @@ const Dashboard = () => {
     const result = await retryCall(callId, purpose, {
       callBackendToken: callBackendToken ?? undefined,
       phone_number: (task.payload?.phone_number as string) ?? undefined,
+      userId: userId ?? undefined,
     });
     if (!result) return null;
     const mergedPayload = {

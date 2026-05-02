@@ -53,6 +53,8 @@ def _normalize_bill_fields(data: dict[str, Any]) -> dict[str, str]:
     mapping = {
         "company_provider_name": "companyProviderName",
         "bill_amount": "billAmount",
+        "invoice_number": "invoiceNumber",
+        "account_number": "accountNumber",
         "account_or_invoice_number": "accountOrInvoiceNumber",
         "bill_due_date": "billDueDate",
         "charge_or_service_date": "chargeOrServiceDate",
@@ -62,7 +64,30 @@ def _normalize_bill_fields(data: dict[str, Any]) -> dict[str, str]:
         val = _safe_str(data.get(src))
         if val:
             out[dst] = val
+    # Legacy single blob: split into invoice vs account when specific keys were empty
+    if not out.get("invoiceNumber") and not out.get("accountNumber"):
+        legacy = _safe_str(data.get("account_or_invoice_number")) or out.get("accountOrInvoiceNumber")
+        if legacy:
+            if re.search(r"\binv(?:oice)?[\s_#:-]", legacy, re.IGNORECASE) or re.match(
+                r"^INV[_\-]?\d", legacy, re.IGNORECASE
+            ):
+                out["invoiceNumber"] = legacy
+            else:
+                out["accountNumber"] = legacy
+    inv = out.get("invoiceNumber") or ""
+    acct = out.get("accountNumber") or ""
+    if inv and acct:
+        out.pop("accountOrInvoiceNumber", None)
+    elif inv or acct:
+        out["accountOrInvoiceNumber"] = inv or acct
     return out
+
+
+def _signed_url_from_response(signed: Any) -> str | None:
+    """Support both Supabase response key variants across SDK versions."""
+    if not isinstance(signed, dict):
+        return None
+    return _safe_str(signed.get("signedURL")) or _safe_str(signed.get("signedUrl"))
 
 
 def _extract_from_image_url(image_url: str) -> dict[str, str]:
@@ -71,8 +96,11 @@ def _extract_from_image_url(image_url: str) -> dict[str, str]:
         return {}
     prompt = (
         "Extract bill facts from this image and return JSON only with these keys: "
-        "company_provider_name, bill_amount, account_or_invoice_number, bill_due_date, charge_or_service_date, billing_phone_number. "
-        "If a field is missing, set it to empty string."
+        "company_provider_name, bill_amount, invoice_number, account_number, bill_due_date, charge_or_service_date, billing_phone_number. "
+        "Put the value labeled Invoice / Invoice number / INV in invoice_number. "
+        "Put the value labeled Account / Account number / Patient account in account_number. "
+        "When both exist, they must differ—do not copy the account number into invoice_number. "
+        "If a field is missing, use empty string."
     )
     try:
         completion = client.chat.completions.create(
@@ -118,8 +146,11 @@ def _extract_from_pdf_bytes(blob: bytes) -> dict[str, str]:
         return {}
     prompt = (
         "Extract bill facts from this text and return JSON only with these keys: "
-        "company_provider_name, bill_amount, account_or_invoice_number, bill_due_date, charge_or_service_date, billing_phone_number. "
-        "If a field is missing, set it to empty string.\n\n"
+        "company_provider_name, bill_amount, invoice_number, account_number, bill_due_date, charge_or_service_date, billing_phone_number. "
+        "Put the value labeled Invoice / Invoice number / INV in invoice_number. "
+        "Put the value labeled Account / Account number in account_number. "
+        "When both exist, they must differ—do not copy the account number into invoice_number. "
+        "If a field is missing, use empty string.\n\n"
         f"Bill text:\n{pdf_text}"
     )
     try:
@@ -155,7 +186,7 @@ def extract_bill_fields_from_attachments(attachments: list[dict[str, Any]]) -> d
                     path,
                     60,
                 )
-                signed_url = _safe_str((signed or {}).get("signedURL"))
+                signed_url = _signed_url_from_response(signed)
                 if signed_url:
                     extracted = _extract_from_image_url(signed_url)
             elif content_type == _SUPPORTED_PDF:

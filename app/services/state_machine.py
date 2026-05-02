@@ -134,6 +134,17 @@ def _fallback_vet_purpose_from_message(msg: str) -> str | None:
     return None
 
 
+def _clip_attachment_metadata_from_message(text: str) -> str:
+    """Strip client-injected attachment summaries so purpose extraction does not swallow them."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    m = re.search(r"\buploaded\s+attachments\s*:", s, re.IGNORECASE)
+    if m:
+        s = s[: m.start()].strip()
+    return s
+
+
 def _extract_call_reason(msg: str) -> str | None:
     """Extract call purpose from a message.
 
@@ -141,7 +152,8 @@ def _extract_call_reason(msg: str) -> str | None:
     - information gathering: "call X to ask/check/find out ..."
     - message delivery: "call X and tell them/let them know/inform/share ..."
     """
-    m = re.sub(r"\s+", " ", (msg or "").strip())
+    msg = _clip_attachment_metadata_from_message(msg or "")
+    m = re.sub(r"\s+", " ", msg.strip())
     if not m:
         return None
     # Strip leading "dial X and" / "call X and" so we match the intent clause (e.g. "check the neutering cost for a cat")
@@ -246,7 +258,8 @@ def _extract_call_reason(msg: str) -> str | None:
         r"(?:inquire|get)\s+(?:about\s+)?(.+)",
         r"check\s+(.+)",  # "check the neutering cost for a cat" -> full phrase (before generic "for")
         r"find\s+out\s+(.+)",
-        r"to\s+((?:return|cancel|reschedule|make|book|schedule|order|request|report|discuss|dispute|buy|change|update|complain|inquire)\b.+)",
+        # Non-greedy; after whitespace collapse, stop before a second "Call …" clause or end of string
+        r"to\s+((?:return|cancel|reschedule|make|book|schedule|order|request|report|discuss|dispute|buy|change|update|complain|inquire)\b.+?)(?=\s+Call\s+|\Z)",
         r"(?:can\s+you\s+)?(?:please\s+)?return\s+(.+)",  # e.g. "Can you return the damaged strawberries to 9452644540?"
     ]
     for pat, prefix in delivery_patterns:

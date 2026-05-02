@@ -15,6 +15,7 @@ from typing import Any
 
 # Reuse phone/reason helpers from main state machine to stay consistent
 from app.services.state_machine import (
+    _clip_attachment_metadata_from_message,
     _extract_call_reason,
     _is_no,
     _is_yes,
@@ -438,7 +439,8 @@ def _extract_general_call_details(msg: str) -> str:
     Preserve the user's full call objective/details (constraints + questions), while
     removing phone digits and generic call-command prefixes.
     """
-    text = _strip_phone_numbers((msg or "").strip())
+    text = _clip_attachment_metadata_from_message((msg or "").strip())
+    text = _strip_phone_numbers(text)
     # Ignore raw machine payload used by multi-select cards.
     text = _PARKING_QUEUE_PAYLOAD_RE.sub("", text).strip()
     if not text:
@@ -600,13 +602,26 @@ def transition(
         if phone_val:
             context["phone"] = phone_val
             context["hospital_phone"] = phone_val
+            prefill = context.pop("bill_dispute_prefill", None)
             reason = _extract_call_reason(msg)
             details = _extract_general_call_details(msg) if is_general_call else ""
-            if reason:
-                # Store extracted purpose/message (may already be prefixed like "Tell them: ...")
-                context["call_reason"] = reason
-            if details:
-                context["call_details"] = details
+            if isinstance(prefill, dict):
+                pr = str(prefill.get("call_reason") or "").strip()
+                pd = str(prefill.get("call_details") or "").strip()
+                if pr:
+                    context["call_reason"] = pr
+                elif reason:
+                    # Store extracted purpose/message (may already be prefixed like "Tell them: ...")
+                    context["call_reason"] = reason
+                if pd:
+                    context["call_details"] = pd
+                elif details:
+                    context["call_details"] = details
+            else:
+                if reason:
+                    context["call_reason"] = reason
+                if details:
+                    context["call_details"] = details
             # general_business_quote or general_call: if we still don't have a specific reason, ask
             if is_general_call and not _reason_is_set(context):
                 return (
