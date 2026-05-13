@@ -24,20 +24,6 @@ const Landing = () => {
     signOut();
     navigate("/");
   };
-  const trustedLogos = [
-    "Amazon",
-    "Walmart",
-    "Chase",
-    "Verizon",
-    "Instacart",
-    "Target",
-    "Amazon",
-    "Walmart",
-    "Chase",
-    "Verizon",
-    "Instacart",
-    "Target",
-  ];
   return (
     <div className="min-h-screen bg-background relative overflow-hidden">
       {/* Subtle Background */}
@@ -509,27 +495,6 @@ const Landing = () => {
                   </span>
                 </div>
               </div>
-            </div>
-          </div>
-        </section>
-
-        {/* Trusted By Section - Scrolling at bottom */}
-        <section className="relative py-16 bg-muted/20 overflow-hidden">
-          <div className="text-center mb-8">
-            <p className="text-sm font-medium text-muted-foreground tracking-wider uppercase">
-              Trusted By
-            </p>
-          </div>
-          <div className="relative">
-            <div className="flex animate-scroll-left">
-              {trustedLogos.map((logo, index) => (
-                <div
-                  key={index}
-                  className="flex-shrink-0 mx-12 text-muted-foreground/60 font-semibold text-xl"
-                >
-                  {logo}
-                </div>
-              ))}
             </div>
           </div>
         </section>
