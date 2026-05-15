@@ -5,6 +5,8 @@ import re
 from enum import Enum
 from typing import Any
 
+from app.services.chatgpt_fallback import reply_for_call_confirm_amendment
+from app.services.language_bridge import is_language_locale_meta_message
 from app.services.places_search import resolve_clinics_near_zip
 
 MAX_CLINIC_SELECTIONS = 4
@@ -143,6 +145,56 @@ def _clip_attachment_metadata_from_message(text: str) -> str:
     if m:
         s = s[: m.start()].strip()
     return s
+
+
+CALL_DETAILS_CONTEXT_MAX = 2000
+_CONFIRM_NOTE_SNIPPET_MAX = 200
+
+
+def append_user_note_to_call_details(context: dict[str, Any], message: str) -> str:
+    """
+    Append free-form confirmation-stage text to context['call_details'].
+
+    Returns a short snippet for user-facing acknowledgment, or '' when nothing
+    was stored (empty input, or an exact duplicate of text already on file).
+    """
+    text = _clip_attachment_metadata_from_message((message or "").strip())
+    text = _strip_phone_numbers(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) < 2:
+        return ""
+    piece = text[:800]
+    existing = str(context.get("call_details") or "").strip()
+    prior_lines = {ln.strip() for ln in existing.splitlines() if ln.strip()}
+    if piece in prior_lines or piece == existing:
+        return ""
+    combined = f"{existing}\n{piece}".strip() if existing else piece
+    context["call_details"] = combined[:CALL_DETAILS_CONTEXT_MAX]
+    if len(text) <= _CONFIRM_NOTE_SNIPPET_MAX:
+        return text
+    return text[: _CONFIRM_NOTE_SNIPPET_MAX - 1].rstrip() + "…"
+
+
+def append_call_confirm_user_note(context: dict[str, Any], message: str) -> str:
+    """
+    Persist a user turn during outbound-call confirmation.
+
+    The plain deduper can reject some legitimate edits (e.g. rare collisions with OCR
+    lines, or double-submit). Retry with a stable prefix so instructions still reach
+    call_details for the phone agent.
+    """
+    raw = (message or "").strip()
+    if len(raw) < 2:
+        return ""
+    if append_user_note_to_call_details(context, raw):
+        return raw
+    prefixed = f"Caller add-on: {raw}"
+    if append_user_note_to_call_details(context, prefixed):
+        return raw
+    stamped = f"Caller add-on (repeat turn): {raw}"
+    if append_user_note_to_call_details(context, stamped):
+        return raw
+    return ""
 
 
 def _extract_call_reason(msg: str) -> str | None:
@@ -470,6 +522,13 @@ def _build_call_summary(context: dict[str, Any]) -> str:
     # Availability
     if context.get("availability"):
         parts.append(f"• Availability: {context['availability']}")
+    details = str(context.get("call_details") or "").strip()
+    if details:
+        raw_items = [x.strip(" -•\t") for x in re.split(r"[.?!]\s+|\n+", details) if x.strip()]
+        if raw_items:
+            parts.append("• Talking points:")
+            for item in raw_items:
+                parts.append(f"  – {item}")
     # Who we'll call
     selected = context.get("selected_clinics") or []
     if selected:
@@ -519,6 +578,7 @@ def transition(
     message: str,
     context: dict[str, Any],
     user_id: str,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> tuple[ConversationState, dict[str, Any], str, list[Any] | None]:
     """
     Deterministic transition. Returns (new_state, updated_context, reply_text, ui_options).
@@ -856,10 +916,52 @@ def transition(
                 "No problem. Your request is not placed. You can start a new request anytime, or reply with different clinic numbers to change your selection.",
                 None,
             )
+        if is_language_locale_meta_message(msg):
+            summary = _build_call_summary(context)
+            return (
+                state,
+                context,
+                "Sure—I can keep replying in Simplified Chinese. Nothing changed about your call "
+                "request—we're still ready when you are:\n\n"
+                + summary,
+                None,
+            )
+        snippet = append_call_confirm_user_note(context, msg)
+        if snippet:
+            summary = _build_call_summary(context)
+            safe = snippet.replace('"', "'")
+            return (
+                state,
+                context,
+                f'Got it, I will add the detail of "{safe}".\n\n'
+                f"Please confirm before I place the call:\n\n{summary}",
+                None,
+            )
+        preview_ctx = {**context}
+        pending_snapshot = _build_call_summary(preview_ctx)
+        facts: dict[str, Any] = {
+            "call_reason": (context.get("call_reason") or "")[:800],
+            "call_details": (context.get("call_details") or "")[:2000],
+            "hospital_phone": context.get("hospital_phone"),
+            "zip": context.get("zip"),
+            "pet_profile_id": context.get("pet_profile_id"),
+        }
+        llm_reply, extra_lines = reply_for_call_confirm_amendment(
+            user_message=msg,
+            conversation_history=conversation_history,
+            pending_confirmation_markdown=pending_snapshot,
+            context_facts=facts,
+        )
+        if llm_reply.strip():
+            for ln in extra_lines:
+                append_user_note_to_call_details(context, ln)
+            return (state, context, llm_reply.strip(), None)
+        summary = _build_call_summary(context)
         return (
             state,
             context,
-            "Please answer Yes or No: should I proceed with the call?",
+            "Here's the current call plan. Update anything you like in your next message, "
+            "or reply Yes to place the call.\n\n" + summary,
             None,
         )
 

@@ -6,6 +6,7 @@ import {
   getChatResponse,
   getCallStatus,
   sendChatMessage,
+  seedPythonConversationIdCache,
   type ChatAttachmentPayload,
   type ChatPersonalProfilePayload,
   type ExtractedBillFields,
@@ -169,7 +170,8 @@ function buildProcessSteps(userText: string, assistantText?: string): string[] {
   const hasCallIntent = /call|phone|拨打|打电话/i.test(blob);
   let step3 = "Collecting the best matching details";
   if (hasParkingIntent) step3 = "Collecting parking options and contacts";
-  else if (hasMedicalIntent) step3 = "Collecting hospital / urgent care options";
+  else if (hasMedicalIntent)
+    step3 = "Collecting hospital / urgent care options";
   else if (hasVetIntent) step3 = "Collecting veterinary clinic options";
   else if (hasCallIntent) step3 = "Preparing call-ready details";
   return [
@@ -322,8 +324,59 @@ export function ConversationView({
       ];
 
   const [messages, setMessages] = useState<Message[]>(initialMsgs);
+
+  const pythonConversationStorageKey = `holdless_python_conversation_id:${userId}`;
+  const persistPythonConversationId = (id: string | undefined | null) => {
+    const trimmed = (id || "").trim();
+    if (!trimmed) return;
+    conversationIdRef.current = trimmed;
+    try {
+      sessionStorage.setItem(pythonConversationStorageKey, trimmed);
+    } catch {
+      /* private mode */
+    }
+  };
+  const restorePythonConversationIdFromSession = (): string | null => {
+    try {
+      const s = sessionStorage.getItem(pythonConversationStorageKey);
+      return s && s.trim() ? s.trim() : null;
+    } catch {
+      return null;
+    }
+  };
+  /** If the ref was cleared (e.g. remount) but the thread is still a Python call-confirm flow, restore id from session. */
+  const resolvePythonConversationIdForSend = (): string | null => {
+    let cid = conversationIdRef.current;
+    if (cid) return cid;
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant");
+    const awaiting =
+      !!lastAssistant &&
+      (/Should I proceed with the call/i.test(lastAssistant.content) ||
+        /Please confirm before I place the call/i.test(lastAssistant.content) ||
+        /Please confirm:/i.test(lastAssistant.content) ||
+        /I'll call that number/i.test(lastAssistant.content));
+    if (!awaiting) return null;
+    const sid = restorePythonConversationIdFromSession();
+    if (!sid) return null;
+    conversationIdRef.current = sid;
+    return sid;
+  };
+  const messagesSuggestPythonStateMachine = (): boolean =>
+    messages.some(
+      (m) =>
+        m.role === "assistant" &&
+        (/Should I proceed with the call/i.test(m.content) ||
+          /Please confirm/i.test(m.content) ||
+          /I'll call that number/i.test(m.content) ||
+          /\*\*Talking points\*\*/.test(m.content)),
+    );
+
   const [inputValue, setInputValue] = useState("");
-  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<
+    PendingAttachment[]
+  >([]);
   const [attachmentPreviewUrls, setAttachmentPreviewUrls] = useState<
     Record<string, string>
   >({});
@@ -344,9 +397,15 @@ export function ConversationView({
   const recognitionRef = useRef<any | null>(null);
 
   useEffect(() => {
+    const id = initialConversationId?.trim();
+    if (id) seedPythonConversationIdCache(userId, id);
+  }, [userId, initialConversationId]);
+
+  useEffect(() => {
     if (typeof window === "undefined") return;
     const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      (window as any).SpeechRecognition ||
+      (window as any).webkitSpeechRecognition;
     if (!SpeechRecognition) {
       setHasSpeechSupport(false);
       return;
@@ -415,7 +474,10 @@ export function ConversationView({
   ): ParkingOption[] | undefined => {
     if (!Array.isArray(options)) return undefined;
     const mapped = options
-      .filter((opt): opt is Record<string, unknown> => !!opt && typeof opt === "object")
+      .filter(
+        (opt): opt is Record<string, unknown> =>
+          !!opt && typeof opt === "object",
+      )
       .filter((opt) => opt.type === "parking_place")
       .map((opt) => ({
         type: "parking_place" as const,
@@ -438,8 +500,7 @@ export function ConversationView({
         location_query:
           typeof opt.location_query === "string" ? opt.location_query : "",
         note: typeof opt.note === "string" ? opt.note : "",
-        call_reason:
-          typeof opt.call_reason === "string" ? opt.call_reason : "",
+        call_reason: typeof opt.call_reason === "string" ? opt.call_reason : "",
         flow_tag: typeof opt.flow_tag === "string" ? opt.flow_tag : "",
       }))
       .filter((opt) => !!opt.name);
@@ -451,7 +512,10 @@ export function ConversationView({
   ): CalSlotOption[] | undefined => {
     if (!Array.isArray(options)) return undefined;
     const mapped = options
-      .filter((opt): opt is Record<string, unknown> => !!opt && typeof opt === "object")
+      .filter(
+        (opt): opt is Record<string, unknown> =>
+          !!opt && typeof opt === "object",
+      )
       .filter((opt) => opt.type === "cal_slot")
       .map((opt) => ({
         type: "cal_slot" as const,
@@ -471,23 +535,26 @@ export function ConversationView({
   ): CallTask[] => {
     if (!data) return [];
     const defaultPurpose = data.callReason ?? fallbackPurpose.slice(0, 80);
-    const queuedCalls = Array.isArray(data.queued_calls) ? data.queued_calls : [];
+    const queuedCalls = Array.isArray(data.queued_calls)
+      ? data.queued_calls
+      : [];
     const queuedTasks = queuedCalls
       .filter((entry) => !!entry?.callId)
       .map((entry, index) => {
-        const placeName = (entry.name || '').trim();
-        const taskId = queuedCalls.length === 1 && data.task_id
-          ? data.task_id
-          : `${data.task_id ?? 'call'}-${entry.callId}`;
+        const placeName = (entry.name || "").trim();
+        const taskId =
+          queuedCalls.length === 1 && data.task_id
+            ? data.task_id
+            : `${data.task_id ?? "call"}-${entry.callId}`;
         return {
           id: taskId,
           callId: entry.callId,
-          title: data.domain ?? 'unknown',
+          title: data.domain ?? "unknown",
           description: defaultPurpose,
-          vendor: placeName || 'Phone Call',
+          vendor: placeName || "Phone Call",
           createdAt: new Date(),
-          priority: 'high' as const,
-          status: 'in_progress' as const,
+          priority: "high" as const,
+          status: "in_progress" as const,
           payload: {
             queue_index: index + 1,
             place_name: placeName || undefined,
@@ -501,12 +568,12 @@ export function ConversationView({
       {
         id: data.task_id ?? `call-${data.callId}`,
         callId: data.callId,
-        title: data.domain ?? 'unknown',
+        title: data.domain ?? "unknown",
         description: defaultPurpose,
-        vendor: 'Phone Call',
+        vendor: "Phone Call",
         createdAt: new Date(),
-        priority: 'high',
-        status: 'in_progress',
+        priority: "high",
+        status: "in_progress",
       },
     ];
   };
@@ -519,7 +586,7 @@ export function ConversationView({
     if (tasks.length === 0) return;
     tasks.forEach((task) => {
       onCallTaskCreated?.(task);
-      onCallTaskStatusUpdate?.(task.callId, 'in_progress');
+      onCallTaskStatusUpdate?.(task.callId, "in_progress");
     });
   };
 
@@ -568,7 +635,7 @@ export function ConversationView({
               debug_state: pythonData.debug_state,
             });
           if (pythonData.conversation_id)
-            conversationIdRef.current = pythonData.conversation_id;
+            persistPythonConversationId(pythonData.conversation_id);
           const assistantMessage: Message = {
             id: "2",
             role: "assistant",
@@ -782,14 +849,14 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
 
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(buttonLabel));
-    const cid = conversationIdRef.current;
-    if (cid) {
-      const data = await sendChatMessage(userId, buttonLabel, cid, {
+    const cid = resolvePythonConversationIdForSend();
+    if (cid || messagesSuggestPythonStateMachine()) {
+      const data = await sendChatMessage(userId, buttonLabel, cid ?? undefined, {
         callBackendToken: callBackendToken ?? undefined,
         personalProfile: personalProfilePayload,
       });
       if (data?.conversation_id)
-        conversationIdRef.current = data.conversation_id;
+        persistPythonConversationId(data.conversation_id);
       const content = data?.reply_text ?? API_OFFLINE_MESSAGE;
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
@@ -805,7 +872,10 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
       setMessages((prev) => [...prev, assistantMessage]);
       setIsThinking(false);
       setThinkingSteps(null);
-      const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+      const trialRem = callTrialRemainingFromChatResponse(
+        user?.id ?? null,
+        data ?? undefined,
+      );
       if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
       emitCallTasksFromResponse(data, buttonLabel);
       return;
@@ -843,8 +913,11 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
   };
   const handleSend = async () => {
     const text = inputValue.trim();
-    if ((!text && pendingAttachments.length === 0) || isThinking || isSearching) return;
-    const attachmentsForSend = pendingAttachments.map(({ previewUrl: _preview, ...rest }) => rest);
+    if ((!text && pendingAttachments.length === 0) || isThinking || isSearching)
+      return;
+    const attachmentsForSend = pendingAttachments.map(
+      ({ previewUrl: _preview, ...rest }) => rest,
+    );
     const composedText = text || "Please analyze the uploaded bill attachment.";
 
     const newUserMessage: Message = {
@@ -860,15 +933,15 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(composedText));
 
-    const cid = conversationIdRef.current;
-    if (cid) {
-      const data = await sendChatMessage(userId, composedText, cid, {
+    const cid = resolvePythonConversationIdForSend();
+    if (cid || messagesSuggestPythonStateMachine()) {
+      const data = await sendChatMessage(userId, composedText, cid ?? undefined, {
         callBackendToken: callBackendToken ?? undefined,
         attachments: attachmentsForSend,
         personalProfile: personalProfilePayload,
       });
       if (data?.conversation_id)
-        conversationIdRef.current = data.conversation_id;
+        persistPythonConversationId(data.conversation_id);
       const content = data?.reply_text ?? API_OFFLINE_MESSAGE;
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
@@ -884,7 +957,10 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
       setMessages((prev) => [...prev, assistantMessage]);
       setIsThinking(false);
       setThinkingSteps(null);
-      const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+      const trialRem = callTrialRemainingFromChatResponse(
+        user?.id ?? null,
+        data ?? undefined,
+      );
       if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
       emitCallTasksFromResponse(data, composedText);
       return;
@@ -1047,7 +1123,10 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
               (file.path ? attachmentPreviewUrls[file.path] || null : null)
             : null;
           return (
-            <div key={`${file.path}-${file.fileName}`} className="rounded-lg border border-gray-200 p-2 bg-white/70">
+            <div
+              key={`${file.path}-${file.fileName}`}
+              className="rounded-lg border border-gray-200 p-2 bg-white/70"
+            >
               {previewSrc ? (
                 <img
                   src={previewSrc}
@@ -1090,100 +1169,113 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
   }) => {
     const parkingKey = (opt: ParkingOption) =>
       `${messageId}::${opt.name}::${opt.phone || ""}::${opt.address || ""}`;
-    const selectedOptions = options.filter((opt) => !!opt.phone && selectedParkingKeys[parkingKey(opt)]);
+    const selectedOptions = options.filter(
+      (opt) => !!opt.phone && selectedParkingKeys[parkingKey(opt)],
+    );
     return (
-    <div className="mt-4">
-      <div className="flex items-center justify-between mb-3">
-        <p className="text-sm text-gray-600">
-          Select one or more cards, then start to call.
-        </p>
-      </div>
-      <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white mb-4">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 text-gray-700">
-            <tr>
-              <th className="text-left px-4 py-3 font-semibold">Name</th>
-              <th className="text-left px-4 py-3 font-semibold">Phone</th>
-              <th className="text-left px-4 py-3 font-semibold">Address</th>
-              <th className="text-left px-4 py-3 font-semibold">Rating</th>
-              <th className="text-left px-4 py-3 font-semibold">Open Now</th>
-              <th className="text-left px-4 py-3 font-semibold">Note</th>
-            </tr>
-          </thead>
-          <tbody>
-            {options.map((opt, idx) => (
-              <tr key={`row-${opt.name}-${idx}`} className="border-t border-gray-100 align-top">
-                <td className="px-4 py-3 text-gray-900">{opt.name}</td>
-                <td className="px-4 py-3 text-gray-700">{opt.phone || "N/A"}</td>
-                <td className="px-4 py-3 text-gray-700">{opt.address || "Address unavailable"}</td>
-                <td className="px-4 py-3 text-gray-700">
-                  {opt.rating != null ? `${opt.rating}/5` : "N/A"}
-                </td>
-                <td className="px-4 py-3 text-gray-700">
-                  {opt.open_now === true ? "24h / Open now" : "Unknown"}
-                </td>
-                <td className="px-4 py-3 text-gray-700">
-                  {opt.note || "Can ask monthly rent"}
-                </td>
+      <div className="mt-4">
+        <div className="flex items-center justify-between mb-3">
+          <p className="text-sm text-gray-600">
+            Select one or more cards, then start to call.
+          </p>
+        </div>
+        <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white mb-4">
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 text-gray-700">
+              <tr>
+                <th className="text-left px-4 py-3 font-semibold">Name</th>
+                <th className="text-left px-4 py-3 font-semibold">Phone</th>
+                <th className="text-left px-4 py-3 font-semibold">Address</th>
+                <th className="text-left px-4 py-3 font-semibold">Rating</th>
+                <th className="text-left px-4 py-3 font-semibold">Open Now</th>
+                <th className="text-left px-4 py-3 font-semibold">Note</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
-        {options.map((opt, idx) => {
-          const canCall = !!opt.phone;
-          const key = parkingKey(opt);
-          const isSelected = !!selectedParkingKeys[key];
-          return (
-            <div
-              key={`${opt.name}-${idx}`}
-              className={`border rounded-lg p-3 bg-white ${isSelected ? "border-blue-300" : "border-gray-200"}`}
-            >
-              <p className="font-medium text-[15px] leading-5 text-gray-900 line-clamp-1">{opt.name}</p>
-              <p className="text-[13px] leading-5 text-gray-500 mt-1 line-clamp-2">
-                {opt.address || "Address unavailable"}
-              </p>
-              <p className="text-[13px] leading-5 text-gray-600 mt-0.5 line-clamp-1">
-                {opt.phone || "Phone unavailable"}
-              </p>
-              <div className="flex items-center justify-between mt-2">
-                <span className="text-[12px] text-gray-500">
-                  {opt.rating != null ? `Rating ${opt.rating}` : "No rating"}
-                </span>
-                <button
-                  disabled={!canCall || isThinking || isSearching}
-                  onClick={() => {
-                    if (!canCall) return;
-                    setSelectedParkingKeys((prev) => ({
-                      ...prev,
-                      [key]: !prev[key],
-                    }));
-                  }}
-                  className={`px-3 py-1.5 rounded-md text-[12px] font-medium disabled:opacity-40 ${
-                    isSelected
-                      ? "bg-blue-50 text-blue-700 border border-blue-200"
-                      : "bg-gray-900 text-white"
-                  }`}
+            </thead>
+            <tbody>
+              {options.map((opt, idx) => (
+                <tr
+                  key={`row-${opt.name}-${idx}`}
+                  className="border-t border-gray-100 align-top"
                 >
-                  {isSelected ? "Selected" : "Select"}
-                </button>
+                  <td className="px-4 py-3 text-gray-900">{opt.name}</td>
+                  <td className="px-4 py-3 text-gray-700">
+                    {opt.phone || "N/A"}
+                  </td>
+                  <td className="px-4 py-3 text-gray-700">
+                    {opt.address || "Address unavailable"}
+                  </td>
+                  <td className="px-4 py-3 text-gray-700">
+                    {opt.rating != null ? `${opt.rating}/5` : "N/A"}
+                  </td>
+                  <td className="px-4 py-3 text-gray-700">
+                    {opt.open_now === true ? "24h / Open now" : "Unknown"}
+                  </td>
+                  <td className="px-4 py-3 text-gray-700">
+                    {opt.note || "Can ask monthly rent"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
+          {options.map((opt, idx) => {
+            const canCall = !!opt.phone;
+            const key = parkingKey(opt);
+            const isSelected = !!selectedParkingKeys[key];
+            return (
+              <div
+                key={`${opt.name}-${idx}`}
+                className={`border rounded-lg p-3 bg-white ${isSelected ? "border-blue-300" : "border-gray-200"}`}
+              >
+                <p className="font-medium text-[15px] leading-5 text-gray-900 line-clamp-1">
+                  {opt.name}
+                </p>
+                <p className="text-[13px] leading-5 text-gray-500 mt-1 line-clamp-2">
+                  {opt.address || "Address unavailable"}
+                </p>
+                <p className="text-[13px] leading-5 text-gray-600 mt-0.5 line-clamp-1">
+                  {opt.phone || "Phone unavailable"}
+                </p>
+                <div className="flex items-center justify-between mt-2">
+                  <span className="text-[12px] text-gray-500">
+                    {opt.rating != null ? `Rating ${opt.rating}` : "No rating"}
+                  </span>
+                  <button
+                    disabled={!canCall || isThinking || isSearching}
+                    onClick={() => {
+                      if (!canCall) return;
+                      setSelectedParkingKeys((prev) => ({
+                        ...prev,
+                        [key]: !prev[key],
+                      }));
+                    }}
+                    className={`px-3 py-1.5 rounded-md text-[12px] font-medium disabled:opacity-40 ${
+                      isSelected
+                        ? "bg-blue-50 text-blue-700 border border-blue-200"
+                        : "bg-gray-900 text-white"
+                    }`}
+                  >
+                    {isSelected ? "Selected" : "Select"}
+                  </button>
+                </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })}
+        </div>
+        <div className="mt-3 flex justify-end">
+          <button
+            disabled={selectedOptions.length === 0 || isThinking || isSearching}
+            onClick={() =>
+              void handleStartSelectedParkingCalls(messageId, options)
+            }
+            className="px-4 py-2 rounded-md text-sm font-medium bg-gray-900 text-white disabled:opacity-40"
+          >
+            Start to call
+          </button>
+        </div>
       </div>
-      <div className="mt-3 flex justify-end">
-        <button
-          disabled={selectedOptions.length === 0 || isThinking || isSearching}
-          onClick={() => void handleStartSelectedParkingCalls(messageId, options)}
-          className="px-4 py-2 rounded-md text-sm font-medium bg-gray-900 text-white disabled:opacity-40"
-        >
-          Start to call
-        </button>
-      </div>
-    </div>
-  );
+    );
   };
   const handleStartSelectedParkingCalls = async (
     messageId: string,
@@ -1192,7 +1284,9 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     if (isThinking || isSearching) return;
     const keyFor = (opt: ParkingOption) =>
       `${messageId}::${opt.name}::${opt.phone || ""}::${opt.address || ""}`;
-    const selected = options.filter((opt) => !!opt.phone && selectedParkingKeys[keyFor(opt)]);
+    const selected = options.filter(
+      (opt) => !!opt.phone && selectedParkingKeys[keyFor(opt)],
+    );
     if (selected.length === 0) return;
     const callReason =
       selected.find((opt) => (opt.call_reason || "").trim())?.call_reason ||
@@ -1205,7 +1299,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
       })),
       call_reason: callReason,
       flow_tag:
-        selected.find((opt) => (opt.flow_tag || "").trim())?.flow_tag || undefined,
+        selected.find((opt) => (opt.flow_tag || "").trim())?.flow_tag ||
+        undefined,
     };
     const combinedPrompt = `[[PARKING_QUEUE]] ${JSON.stringify(payload)}`;
 
@@ -1222,12 +1317,17 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
         selected.map((opt) => opt.location_query || opt.name).join(" "),
       ),
     );
-    const cid = conversationIdRef.current;
-    const data = await sendChatMessage(userId, combinedPrompt, cid || undefined, {
-      callBackendToken: callBackendToken ?? undefined,
-      personalProfile: personalProfilePayload,
-    });
-    if (data?.conversation_id) conversationIdRef.current = data.conversation_id;
+    const cid = resolvePythonConversationIdForSend();
+    const data = await sendChatMessage(
+      userId,
+      combinedPrompt,
+      cid || undefined,
+      {
+        callBackendToken: callBackendToken ?? undefined,
+        personalProfile: personalProfilePayload,
+      },
+    );
+    if (data?.conversation_id) persistPythonConversationId(data.conversation_id);
     const content = data?.reply_text ?? API_OFFLINE_MESSAGE;
     const assistantMessage: Message = {
       id: (Date.now() + 1).toString(),
@@ -1243,7 +1343,10 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, assistantMessage]);
     setIsThinking(false);
     setThinkingSteps(null);
-    const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+    const trialRem = callTrialRemainingFromChatResponse(
+      user?.id ?? null,
+      data ?? undefined,
+    );
     if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
     emitCallTasksFromResponse(data, callReason);
   };
@@ -1260,12 +1363,12 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, newUserMessage]);
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(newUserMessage.content));
-    const cid = conversationIdRef.current;
+    const cid = resolvePythonConversationIdForSend();
     const data = await sendChatMessage(userId, callPrompt, cid || undefined, {
       callBackendToken: callBackendToken ?? undefined,
       personalProfile: personalProfilePayload,
     });
-    if (data?.conversation_id) conversationIdRef.current = data.conversation_id;
+    if (data?.conversation_id) persistPythonConversationId(data.conversation_id);
     const content = data?.reply_text ?? API_OFFLINE_MESSAGE;
     const assistantMessage: Message = {
       id: (Date.now() + 1).toString(),
@@ -1281,7 +1384,10 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, assistantMessage]);
     setIsThinking(false);
     setThinkingSteps(null);
-    const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+    const trialRem = callTrialRemainingFromChatResponse(
+      user?.id ?? null,
+      data ?? undefined,
+    );
     if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
     emitCallTasksFromResponse(data, callPrompt);
   };
@@ -1303,12 +1409,17 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, newUserMessage]);
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(newUserMessage.content));
-    const cid = conversationIdRef.current;
-    const data = await sendChatMessage(userId, combinedPrompt, cid || undefined, {
-      callBackendToken: callBackendToken ?? undefined,
-      personalProfile: personalProfilePayload,
-    });
-    if (data?.conversation_id) conversationIdRef.current = data.conversation_id;
+    const cid = resolvePythonConversationIdForSend();
+    const data = await sendChatMessage(
+      userId,
+      combinedPrompt,
+      cid || undefined,
+      {
+        callBackendToken: callBackendToken ?? undefined,
+        personalProfile: personalProfilePayload,
+      },
+    );
+    if (data?.conversation_id) persistPythonConversationId(data.conversation_id);
     const content = data?.reply_text ?? API_OFFLINE_MESSAGE;
     const assistantMessage: Message = {
       id: (Date.now() + 1).toString(),
@@ -1324,7 +1435,10 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, assistantMessage]);
     setIsThinking(false);
     setThinkingSteps(null);
-    const trialRem = callTrialRemainingFromChatResponse(user?.id ?? null, data ?? undefined);
+    const trialRem = callTrialRemainingFromChatResponse(
+      user?.id ?? null,
+      data ?? undefined,
+    );
     if (trialRem !== undefined) onFreeTrialRemainingChange?.(trialRem);
     emitCallTasksFromResponse(data, newUserMessage.content);
   };
@@ -1506,21 +1620,26 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
           <div className="pr-6">
             {pendingAttachments.length > 0 && (
               <div className="mb-2 rounded-xl border border-gray-200 bg-gray-50 p-2">
-                <p className="text-xs text-gray-600 mb-2">Ready to send with this message:</p>
+                <p className="text-xs text-gray-600 mb-2">
+                  Ready to send with this message:
+                </p>
                 <div className="flex flex-wrap gap-2">
                   {pendingAttachments.map((file, idx) => (
                     <div
                       key={`${file.path}-${idx}`}
                       className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-2 py-1"
                     >
-                      <span className="text-xs text-gray-700">{file.fileName}</span>
+                      <span className="text-xs text-gray-700">
+                        {file.fileName}
+                      </span>
                       <button
                         type="button"
                         onClick={() =>
                           setPendingAttachments((prev) => {
                             const next = [...prev];
                             const removed = next.splice(idx, 1)[0];
-                            if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+                            if (removed?.previewUrl)
+                              URL.revokeObjectURL(removed.previewUrl);
                             return next;
                           })
                         }

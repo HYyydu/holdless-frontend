@@ -1,13 +1,10 @@
 import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router-dom";
-import { Phone, Clock, CheckCircle, Quote } from "lucide-react";
+import { Phone, Clock, CheckCircle } from "lucide-react";
 import Footer from "@/components/Footer";
 import { useDemoAuth } from "@/contexts/DemoAuthContext";
 import { useCallBackendAuth } from "@/contexts/CallBackendAuthContext";
 import { supabase } from "@/integrations/supabase/client";
-import userStory1 from "@/assets/user-story-1.jpg";
-import userStory2 from "@/assets/user-story-2.jpg";
-import userStory3 from "@/assets/user-story-3.jpg";
 const Landing = () => {
   const navigate = useNavigate();
   const { isAuthenticated, signOut } = useDemoAuth();
@@ -253,103 +250,6 @@ const Landing = () => {
           </div>
         </section>
 
-        {/* User Stories Section */}
-        <section className="relative py-24">
-          <div className="container max-w-7xl mx-auto px-4">
-            <div className="text-center space-y-4 mb-16">
-              <h2 className="text-3xl md:text-4xl lg:text-5xl font-bold text-foreground tracking-tight">
-                Real People, Real Results
-              </h2>
-              <p className="text-muted-foreground max-w-xl mx-auto">
-                See how Holdless is helping people reclaim their time
-              </p>
-            </div>
-
-            <div className="space-y-16">
-              {/* Story 1 - Image Left */}
-              <div className="grid md:grid-cols-2 gap-12 items-center">
-                <div className="relative">
-                  <div className="aspect-[4/3] rounded-3xl overflow-hidden">
-                    <img
-                      src={userStory1}
-                      alt="Sarah M."
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
-                </div>
-                <div className="space-y-6">
-                  <Quote className="w-10 h-10 text-primary/30" />
-                  <p className="text-xl md:text-2xl text-foreground leading-relaxed">
-                    I used to spend hours on hold with my internet provider. Now
-                    I just describe the issue and Holdless handles everything.
-                    Last month I saved over 4 hours.
-                  </p>
-                  <div>
-                    <p className="font-semibold text-foreground">Sarah M.</p>
-                    <p className="text-sm text-muted-foreground">
-                      Small Business Owner, Austin
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Story 2 - Image Right */}
-              <div className="grid md:grid-cols-2 gap-12 items-center">
-                <div className="space-y-6 md:order-1">
-                  <Quote className="w-10 h-10 text-primary/30" />
-                  <p className="text-xl md:text-2xl text-foreground leading-relaxed">
-                    The AI got me a $280 refund from a cancelled flight that I'd
-                    given up on. The whole process took 10 minutes of my time
-                    instead of 3 hours.
-                  </p>
-                  <div>
-                    <p className="font-semibold text-foreground">Michael T.</p>
-                    <p className="text-sm text-muted-foreground">
-                      Software Engineer, Seattle
-                    </p>
-                  </div>
-                </div>
-                <div className="relative md:order-2">
-                  <div className="aspect-[4/3] rounded-3xl overflow-hidden">
-                    <img
-                      src={userStory2}
-                      alt="Michael T."
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Story 3 - Image Left */}
-              <div className="grid md:grid-cols-2 gap-12 items-center">
-                <div className="relative">
-                  <div className="aspect-[4/3] rounded-3xl overflow-hidden">
-                    <img
-                      src={userStory3}
-                      alt="Elena R."
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
-                </div>
-                <div className="space-y-6">
-                  <Quote className="w-10 h-10 text-primary/30" />
-                  <p className="text-xl md:text-2xl text-foreground leading-relaxed">
-                    As a busy mom, I don't have time to wait on hold. Holdless
-                    disputed a wrong charge on my credit card while I was at my
-                    kid's soccer game. Problem solved.
-                  </p>
-                  <div>
-                    <p className="font-semibold text-foreground">Elena R.</p>
-                    <p className="text-sm text-muted-foreground">
-                      Marketing Manager, Chicago
-                    </p>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
         {/* Benefits Section */}
         <section className="relative py-24 bg-muted/30">
           <div className="container max-w-7xl mx-auto px-4">
@@ -404,94 +304,104 @@ const Landing = () => {
           <div className="container max-w-7xl mx-auto px-4">
             <div className="text-center space-y-4 mb-16">
               <h2 className="text-3xl md:text-4xl lg:text-5xl font-bold text-foreground tracking-tight">
-                Perfect For Any Support Need
+                Built For Confusing Insurance & Medical Calls
               </h2>
             </div>
 
             <div className="grid md:grid-cols-2 gap-6">
               <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
                 <h3 className="text-lg font-semibold text-foreground mb-3">
-                  E-Commerce Issues
+                  Medical Bill Questions
                 </h3>
                 <p className="text-muted-foreground text-sm leading-relaxed mb-4">
-                  Handle returns, refunds, damaged items, and delivery problems
-                  across all your favorite retailers.
+                  Understand confusing medical bills, request itemized charges,
+                  check insurance processing, and explore payment or financial
+                  assistance options.
                 </p>
                 <div className="flex flex-wrap gap-2">
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Amazon
+                    Hospital Bills
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Walmart
+                    Itemized Charges
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Target
+                    Payment Plans
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Instacart
+                    Billing Errors
                   </span>
                 </div>
               </div>
 
               <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
                 <h3 className="text-lg font-semibold text-foreground mb-3">
-                  Subscription Management
+                  Insurance Claims & Denials
                 </h3>
                 <p className="text-muted-foreground text-sm leading-relaxed mb-4">
-                  Cancel unwanted subscriptions, resolve billing disputes, and
-                  update payment information effortlessly.
+                  Call insurers to clarify claim status, understand denial
+                  reasons, request next steps, and help users prepare appeals.
                 </p>
                 <div className="flex flex-wrap gap-2">
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Streaming
+                    Claim Status
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Software
+                    Denials
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Memberships
+                    Appeals
+                  </span>
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
+                    Coverage Issues
                   </span>
                 </div>
               </div>
 
               <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
                 <h3 className="text-lg font-semibold text-foreground mb-3">
-                  Utilities & Services
+                  Prior Authorization Support
                 </h3>
                 <p className="text-muted-foreground text-sm leading-relaxed mb-4">
-                  Manage internet, phone, and utility accounts. Resolve service
-                  issues and negotiate better rates.
+                  Help users call insurance companies, clinics, or pharmacies to
+                  check prior authorization requirements and missing information.
                 </p>
                 <div className="flex flex-wrap gap-2">
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Verizon
+                    Prior Auth
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    AT&T
+                    Medication
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Comcast
+                    Procedures
+                  </span>
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
+                    Missing Docs
                   </span>
                 </div>
               </div>
 
               <div className="bg-card rounded-2xl p-8 shadow-sm border border-border/40 hover:border-border/60 transition-colors">
                 <h3 className="text-lg font-semibold text-foreground mb-3">
-                  Financial Services
+                  Provider & Pharmacy Coordination
                 </h3>
                 <p className="text-muted-foreground text-sm leading-relaxed mb-4">
-                  Dispute charges, request fee waivers, and handle account
-                  inquiries with banks and credit card companies.
+                  Coordinate calls between doctors, insurers, and pharmacies when
+                  no one gives a clear answer.
                 </p>
                 <div className="flex flex-wrap gap-2">
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Chase
+                    Doctors
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Bank of America
+                    Pharmacies
                   </span>
                   <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
-                    Amex
+                    Insurance
+                  </span>
+                  <span className="text-xs px-3 py-1.5 bg-muted text-muted-foreground rounded-full">
+                    Follow-ups
                   </span>
                 </div>
               </div>

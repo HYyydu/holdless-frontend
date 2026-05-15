@@ -485,22 +485,33 @@ def process(
             desired_outcome = (merged_slots.get("desired_outcome") or {}).get("value") or ""
             uploaded = bool((merged_slots.get("bill_upload") or {}).get("value"))
             lines = ["I have your bill dispute details:", ""]
-            if phone:
-                lines.append(f"• Phone: {phone}")
-            if provider:
-                lines.append(f"• Company/provider name: {provider}")
             if desired_outcome:
-                lines.append(f"• Desired outcome: {desired_outcome}")
-            if amount:
-                lines.append(f"• Bill amount: {amount}")
+                lines.append("**Purpose**")
+                lines.append(desired_outcome)
+                lines.append("")
+
+            talking_points = []
+            if provider:
+                talking_points.append(f"• Company/provider name: {provider}")
             if account:
-                lines.append(f"• Account/invoice number: {account}")
+                talking_points.append(f"• Account/invoice number: {account}")
+            if amount:
+                talking_points.append(f"• Bill amount: {amount}")
             if due_date:
-                lines.append(f"• Bill due date: {due_date}")
+                talking_points.append(f"• Bill due date: {due_date}")
             if charge_date:
-                lines.append(f"• Date of charge/service: {charge_date}")
+                talking_points.append(f"• Date of charge/service: {charge_date}")
             if uploaded:
-                lines.append("• Bill upload: provided (photo/PDF)")
+                talking_points.append("• Bill upload: provided (photo/PDF)")
+
+            if talking_points:
+                lines.append("**Talking points**")
+                lines.extend(talking_points)
+                lines.append("")
+
+            if phone:
+                lines.append("**Destination**")
+                lines.append(f"I will call: {phone}")
             lines.append("")
             lines.append("Should I proceed with the call? (Yes/No)")
             reply = "\n".join(lines)

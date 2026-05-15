@@ -49,6 +49,21 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 def _normalize_bill_fields(data: dict[str, Any]) -> dict[str, str]:
+    """Map model JSON to client field names. Accepts snake_case (prompt) or camelCase drift."""
+    raw: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
+    for snake, camel in (
+        ("company_provider_name", "companyProviderName"),
+        ("bill_amount", "billAmount"),
+        ("invoice_number", "invoiceNumber"),
+        ("account_number", "accountNumber"),
+        ("account_or_invoice_number", "accountOrInvoiceNumber"),
+        ("bill_due_date", "billDueDate"),
+        ("charge_or_service_date", "chargeOrServiceDate"),
+        ("billing_phone_number", "billingPhoneNumber"),
+    ):
+        if not _safe_str(raw.get(snake)) and _safe_str(raw.get(camel)):
+            raw[snake] = raw[camel]
+
     out: dict[str, str] = {}
     mapping = {
         "company_provider_name": "companyProviderName",
@@ -61,12 +76,16 @@ def _normalize_bill_fields(data: dict[str, Any]) -> dict[str, str]:
         "billing_phone_number": "billingPhoneNumber",
     }
     for src, dst in mapping.items():
-        val = _safe_str(data.get(src))
+        val = _safe_str(raw.get(src))
         if val:
             out[dst] = val
     # Legacy single blob: split into invoice vs account when specific keys were empty
     if not out.get("invoiceNumber") and not out.get("accountNumber"):
-        legacy = _safe_str(data.get("account_or_invoice_number")) or out.get("accountOrInvoiceNumber")
+        legacy = (
+            _safe_str(raw.get("account_or_invoice_number"))
+            or _safe_str(raw.get("accountOrInvoiceNumber"))
+            or out.get("accountOrInvoiceNumber")
+        )
         if legacy:
             if re.search(r"\binv(?:oice)?[\s_#:-]", legacy, re.IGNORECASE) or re.match(
                 r"^INV[_\-]?\d", legacy, re.IGNORECASE
@@ -100,7 +119,9 @@ def _extract_from_image_url(image_url: str) -> dict[str, str]:
         "Put the value labeled Invoice / Invoice number / INV in invoice_number. "
         "Put the value labeled Account / Account number / Patient account in account_number. "
         "When both exist, they must differ—do not copy the account number into invoice_number. "
-        "If a field is missing, use empty string."
+        "For billing_phone_number, prefer the patient billing / customer service / Questions line "
+        "(not the main hospital switchboard) when both appear. "
+        "If a field is missing or unreadable, use empty string."
     )
     try:
         completion = client.chat.completions.create(
@@ -150,7 +171,8 @@ def _extract_from_pdf_bytes(blob: bytes) -> dict[str, str]:
         "Put the value labeled Invoice / Invoice number / INV in invoice_number. "
         "Put the value labeled Account / Account number in account_number. "
         "When both exist, they must differ—do not copy the account number into invoice_number. "
-        "If a field is missing, use empty string.\n\n"
+        "For billing_phone_number, prefer patient billing / customer service numbers over general facility lines. "
+        "If a field is missing or unreadable, use empty string.\n\n"
         f"Bill text:\n{pdf_text}"
     )
     try:

@@ -2,22 +2,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.services.conversation_persistence import (
+    append_messages,
     consume_user_request_quota,
     create_conversation,
+    delete_conversation,
     ensure_user,
+    get_conversation_messages,
+    get_recent_conversation_messages_for_prompt,
     get_user_request_quota,
     get_user_request_quota_remaining,
-    update_conversation,
-    append_messages,
     list_conversations,
-    get_conversation_messages,
-    delete_conversation,
+    update_conversation,
 )
 from app.services.conversation_store import load, save, create_new
 from app.services.chatgpt_fallback import Intent, reply_for_no_call_intent
@@ -67,6 +69,8 @@ from app.services.call_placement import (
 from app.services.task_service import create_task, update_task
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 # Do not use bare \bphone\b — attachment summaries contain "billing phone:" and would falsely
 # trigger direct-call before bill-dispute prefill. Allow "phone 945..." as imperative.
@@ -820,6 +824,18 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             k: v for k, v in personal_profile.items() if isinstance(v, (str, int, float, bool))
         }
 
+    conversation_history: list[dict[str, str]] = []
+    if conversation_id:
+        try:
+            conversation_history = get_recent_conversation_messages_for_prompt(conversation_id)
+        except Exception as e:
+            logger.warning(
+                "Could not load recent messages for conversation %s: %s",
+                conversation_id,
+                e,
+                exc_info=True,
+            )
+
     # Resolve current state string for branching.
     current_state_str = state.value if hasattr(state, "value") else state
     at_entry_no_flow = (
@@ -859,7 +875,10 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             f"{original_block}"
         ).strip()
         new_state, updated_context, reply_text, ui_options = return_transition(
-            ReturnFlowState.AWAITING_PHONE_OR_ZIP, combined_message, context
+            ReturnFlowState.AWAITING_PHONE_OR_ZIP,
+            combined_message,
+            context,
+            conversation_history or None,
         )
 
     # Deterministic direct-call entry: if user clearly provides "call + phone number", bypass Layer 1.
@@ -872,7 +891,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
         context["flow_type"] = FLOW_GENERAL_CALL
         return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
         new_state, updated_context, reply_text, ui_options = return_transition(
-            return_state, message, context
+            return_state, message, context, conversation_history or None
         )
 
     if (
@@ -913,7 +932,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
                 combined_message = f"{original_message.strip()} {message.strip()}".strip() or message
                 new_state, updated_context, reply_text, ui_options = return_transition(
-                    return_state, combined_message, context
+                    return_state, combined_message, context, conversation_history or None
                 )
 
     if new_state is None and at_entry_no_flow:
@@ -930,7 +949,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 )
             return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
             new_state, updated_context, reply_text, ui_options = return_transition(
-                return_state, message, context
+                return_state, message, context, conversation_history or None
             )
 
     if new_state is None and at_entry_no_flow and _PLACE_SEARCH_RE.search(message or ""):
@@ -992,13 +1011,16 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             ).strip()
             return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
             new_state, updated_context, reply_text, ui_options = return_transition(
-                return_state, "I want to book this appointment slot", context
+                return_state,
+                "I want to book this appointment slot",
+                context,
+                conversation_history or None,
             )
 
     if new_state is None:
         route = route_flow(
             message,
-            conversation_history=None,
+            conversation_history=conversation_history or None,
             in_flow=in_flow,
             current_flow_type=current_flow_type,
         )
@@ -1007,7 +1029,11 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             return (
                 state,
                 context,
-                reply_for_no_call_intent(message, Intent(intent=intent_name)),
+                reply_for_no_call_intent(
+                    message,
+                    Intent(intent=intent_name),
+                    conversation_history=conversation_history or None,
+                ),
                 None,
             )
 
@@ -1015,7 +1041,11 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             # At entry: Layer 1 decides execution_mode + capability + domain; we apply confidence tiers.
             if route is None:
                 # API failure: fallback to chat, safe clarification
-                reply_text = reply_for_no_call_intent(message, Intent(intent="ROUTER_NO_CALL"))
+                reply_text = reply_for_no_call_intent(
+                    message,
+                    Intent(intent="ROUTER_NO_CALL"),
+                    conversation_history=conversation_history or None,
+                )
                 new_state, updated_context, reply_text, ui_options = state, context, reply_text, None
             elif route.is_low_confidence():
                 # Tier C: never start call
@@ -1050,11 +1080,11 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                     elif flow_type in (FLOW_RETURN_SERVICE, FLOW_GENERAL_BUSINESS_QUOTE, FLOW_GENERAL_CALL):
                         return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
                         new_state, updated_context, reply_text, ui_options = return_transition(
-                            return_state, message, context
+                            return_state, message, context, conversation_history or None
                         )
                     else:
                         new_state, updated_context, reply_text, ui_options = hospital_transition(
-                            state, message, context, user_id
+                            state, message, context, user_id, conversation_history or None
                         )
                 elif route.execution_mode == EXECUTION_HYBRID:
                     context["pending_hybrid_offer"] = {
@@ -1078,11 +1108,23 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 # Router failed: continue in current flow (state machine handles message)
                 pass
             elif route.is_high_confidence() and route.execution_mode == EXECUTION_CHAT:
-                # Escape to no-call: stop flow, reset to entry, respond in chat
-                new_state = ConversationState.AWAITING_ZIP
-                updated_context = clear_slot_state({**context, "flow_type": None})
-                reply_text = reply_for_no_call_intent(message, Intent(intent="ROUTER_NO_CALL"))
-                ui_options = None
+                # Escape to no-call: stop flow, reset to entry, respond in chat — unless we are
+                # waiting for Yes/No on a pending outbound call. In that case Layer 1 often labels
+                # follow-ups ("add this detail", "speak Chinese?") as chat; those must stay in
+                # the confirm flow so the state machine (and optional LLM merge) can update context.
+                _stay_in_call_confirm = in_flow and current_state_str in (
+                    ReturnFlowState.AWAITING_CALL_CONFIRM.value,
+                    ConversationState.AWAITING_CALL_CONFIRM.value,
+                )
+                if not _stay_in_call_confirm:
+                    new_state = ConversationState.AWAITING_ZIP
+                    updated_context = clear_slot_state({**context, "flow_type": None})
+                    reply_text = reply_for_no_call_intent(
+                        message,
+                        Intent(intent="ROUTER_NO_CALL"),
+                        conversation_history=conversation_history or None,
+                    )
+                    ui_options = None
             elif route.is_high_confidence() and route.execution_mode == EXECUTION_CALL:
                 switch_flow_type = layer1_to_flow_type(route)
                 if switch_flow_type is not None and switch_flow_type != current_flow_type:
@@ -1091,11 +1133,11 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                     if switch_flow_type in (FLOW_RETURN_SERVICE, FLOW_GENERAL_BUSINESS_QUOTE, FLOW_GENERAL_CALL):
                         return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
                         new_state, updated_context, reply_text, ui_options = return_transition(
-                            return_state, message, context
+                            return_state, message, context, conversation_history or None
                         )
                     else:
                         new_state, updated_context, reply_text, ui_options = hospital_transition(
-                            state, message, context, user_id
+                            state, message, context, user_id, conversation_history or None
                         )
                 # else: continue in current flow (new_state stays None)
             # else: medium/low confidence — continue in flow (new_state stays None)
@@ -1206,12 +1248,12 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 elif is_return_flow_state(current_state_str):
                     return_state = ReturnFlowState(current_state_str)
                     new_state, updated_context, reply_text, ui_options = return_transition(
-                        return_state, message, context
+                        return_state, message, context, conversation_history or None
                     )
                 else:
                     hospital_state = state if isinstance(state, ConversationState) else ConversationState(current_state_str)
                     new_state, updated_context, reply_text, ui_options = hospital_transition(
-                        hospital_state, message, context, user_id
+                        hospital_state, message, context, user_id, conversation_history or None
                     )
 
     base_context = updated_context if updated_context is not None else context

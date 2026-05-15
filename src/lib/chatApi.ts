@@ -570,9 +570,33 @@ export async function deletePetProfile(
 }
 
 /**
+ * Latest Python `/api/chat` conversation id per user. Survives lost React refs so
+ * follow-ups still send `conversation_id` (without it, the backend creates a new
+ * conversation every request and bill/call-confirm state is lost).
+ */
+const pythonConversationIdByUser = new Map<string, string>();
+
+/** Clear when starting a deliberate new Python thread (`sendChatMessage(..., null, ...)` does this too). */
+export function clearPythonConversationIdCache(userId: string): void {
+  pythonConversationIdByUser.delete(userId);
+}
+
+export function seedPythonConversationIdCache(
+  userId: string,
+  conversationId: string,
+): void {
+  const t = (conversationId || "").trim();
+  if (t) pythonConversationIdByUser.set(userId, t);
+}
+
+/**
  * Send one message and get reply (Python backend: state machine chat).
  * Returns reply_text, conversation_id, debug_state, and optional ui_options.
  * Pass callBackendToken when placing calls so the backend can authenticate with the call service.
+ *
+ * @param conversationId - Explicit id to continue a thread. Pass **`null`** to start a new
+ *   conversation (clears cached id for this user). Pass **`undefined`** or omit to use the
+ *   cached id from the last successful reply when the caller does not have the id in memory.
  */
 export async function sendChatMessage(
   userId: string,
@@ -604,10 +628,21 @@ export async function sendChatMessage(
   error?: string;
   code?: string;
 } | null> {
+  let idForRequest: string | undefined;
+  if (conversationId === null) {
+    pythonConversationIdByUser.delete(userId);
+    idForRequest = undefined;
+  } else if (typeof conversationId === "string" && conversationId.trim()) {
+    idForRequest = conversationId.trim();
+  } else {
+    const cached = pythonConversationIdByUser.get(userId);
+    idForRequest = cached && cached.trim() ? cached.trim() : undefined;
+  }
+
   const body: Record<string, unknown> = {
     user_id: userId,
     message,
-    conversation_id: conversationId || undefined,
+    conversation_id: idForRequest,
   };
   const token = options?.callBackendToken?.trim();
   if (token) {
@@ -627,7 +662,7 @@ export async function sendChatMessage(
     console.log("[History] sendChatMessage", {
       userId,
       messageLength: message.length,
-      conversationId: conversationId ?? "new",
+      conversationId: idForRequest ?? conversationId ?? "new",
     });
   try {
     const res = await fetch("/api/chat", {
@@ -661,7 +696,7 @@ export async function sendChatMessage(
           reply_text:
             detailObj.error ??
             "You have no request quota remaining. Please increase your quota.",
-          conversation_id: conversationId || "",
+          conversation_id: idForRequest || "",
           debug_state: "QUOTA_EXCEEDED",
           free_trial_remaining: detailObj.request_quota_remaining,
           request_quota_remaining: detailObj.request_quota_remaining,
@@ -678,6 +713,10 @@ export async function sendChatMessage(
           "- Ensure Python backend is running and Node proxies POST /api/chat (see server .env PYTHON_BACKEND_URL).",
         );
       return null;
+    }
+    const rid = (data as { conversation_id?: string }).conversation_id;
+    if (typeof rid === "string" && rid.trim()) {
+      pythonConversationIdByUser.set(userId, rid.trim());
     }
     return data as {
       reply_text: string;

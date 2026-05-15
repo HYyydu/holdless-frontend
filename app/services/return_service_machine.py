@@ -14,15 +14,19 @@ from enum import Enum
 from typing import Any
 
 # Reuse phone/reason helpers from main state machine to stay consistent
+from app.services.chatgpt_fallback import reply_for_call_confirm_amendment
+from app.services.language_bridge import is_language_locale_meta_message
 from app.services.state_machine import (
+    PURPOSE_MAX_LENGTH,
     _clip_attachment_metadata_from_message,
     _extract_call_reason,
     _is_no,
     _is_yes,
     _normalize_phone,
     _strip_phone_numbers,
+    append_call_confirm_user_note,
+    append_user_note_to_call_details,
 )
-from app.services.state_machine import PURPOSE_MAX_LENGTH
 
 # Prefix for return-flow states so chat layer can tell which machine to use
 RETURN_STATE_PREFIX = "RETURN_"
@@ -357,13 +361,13 @@ def _build_return_summary(context: dict[str, Any]) -> str:
     """Summary for confirmation step (no pet, no clinics)."""
     purpose = _build_return_call_purpose(context)
     context["call_reason"] = purpose
-    parts = [f"Purpose: {purpose}", ""]
+    parts = ["**Purpose**", purpose, ""]
     details = str(context.get("call_details") or "").strip()
     if details:
         # Keep simple sentence splitting so users can verify all captured asks before placing the call.
         raw_items = [x.strip(" -•\t") for x in re.split(r"[.?!]\s+|\n+", details) if x.strip()]
         if raw_items:
-            parts.append("Talking points:")
+            parts.append("**Talking points**")
             for item in raw_items:
                 parts.append(f"• {item}")
             parts.append("")
@@ -376,6 +380,7 @@ def _build_return_summary(context: dict[str, Any]) -> str:
             parts.append("")
     selected = context.get("selected_clinics") or []
     if isinstance(selected, list) and selected:
+        parts.append("**Destination**")
         parts.append(f"Selected places ({len(selected)}):")
         for idx, item in enumerate(selected, 1):
             if not isinstance(item, dict):
@@ -391,7 +396,8 @@ def _build_return_summary(context: dict[str, Any]) -> str:
                 parts.append(f"   Address: {address}")
         parts.append("")
     elif context.get("phone"):
-        parts.append(f"• I will call: {context['phone']}")
+        parts.append("**Destination**")
+        parts.append(f"I will call: {context['phone']}")
     return "\n".join(parts) + "\n\nShould I proceed with the call? (Yes/No)"
 
 
@@ -565,6 +571,7 @@ def transition(
     state: ReturnFlowState,
     message: str,
     context: dict[str, Any],
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> tuple[ReturnFlowState, dict[str, Any], str, list[Any] | None]:
     """
     Transition for the return-service flow. Returns (new_state, context, reply_text, ui_options).
@@ -800,10 +807,50 @@ def transition(
                 "No problem. Your request is not placed. Send a new number if you'd like to try again.",
                 None,
             )
+        if is_language_locale_meta_message(msg):
+            summary = _build_return_summary(context)
+            return (
+                state,
+                context,
+                "Sure—I can keep replying in Simplified Chinese. Nothing changed about your call "
+                "request—we're still ready when you are:\n\n"
+                + summary,
+                None,
+            )
+        snippet = append_call_confirm_user_note(context, msg)
+        if snippet:
+            summary = _build_return_summary(context)
+            safe = snippet.replace('"', "'")
+            return (
+                state,
+                context,
+                f'Got it, I will add the detail of "{safe}".\n\n' + summary,
+                None,
+            )
+        preview_ctx = {**context}
+        pending_snapshot = _build_return_summary(preview_ctx)
+        facts: dict[str, Any] = {
+            "flow_type": context.get("flow_type"),
+            "call_reason": (context.get("call_reason") or "")[:800],
+            "call_details": (context.get("call_details") or "")[:2000],
+            "phone": context.get("phone") or context.get("hospital_phone"),
+        }
+        llm_reply, extra_lines = reply_for_call_confirm_amendment(
+            user_message=msg,
+            conversation_history=conversation_history,
+            pending_confirmation_markdown=pending_snapshot,
+            context_facts=facts,
+        )
+        if llm_reply.strip():
+            for ln in extra_lines:
+                append_user_note_to_call_details(context, ln)
+            return (state, context, llm_reply.strip(), None)
+        summary = _build_return_summary(context)
         return (
             state,
             context,
-            "Please answer Yes or No: should I proceed with the call?",
+            "Here's the current call plan. Update anything you like in your next message, "
+            "or reply Yes to place the call.\n\n" + summary,
             None,
         )
 

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from app.db.supabase_client import get_supabase
 
+# Last N rows from chat_messages for LLM context (8 = up to four user/assistant turns).
+RECENT_MESSAGES_FOR_PROMPT_DEFAULT = 8
+
 
 def consume_user_request_quota(user_id: str, *, max_retries: int = 3) -> int:
     """
@@ -170,6 +173,40 @@ def get_conversation_messages(conversation_id: str) -> list[dict]:
     )
     data = r.data if hasattr(r, "data") else []
     return [dict(row) for row in data]
+
+
+def get_recent_conversation_messages_for_prompt(
+    conversation_id: str,
+    *,
+    max_messages: int = RECENT_MESSAGES_FOR_PROMPT_DEFAULT,
+) -> list[dict[str, str]]:
+    """
+    Most recent ``max_messages`` chat rows as {role, content} in chronological order.
+    Used for Layer 1 routing and no-call fallback replies. Omits the current turn (not persisted yet).
+    """
+    if not (conversation_id or "").strip():
+        return []
+    cap = max(1, min(int(max_messages), 32))
+    supabase = get_supabase()
+    r = (
+        supabase.table("chat_messages")
+        .select("role, content, created_at")
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=True)
+        .limit(cap)
+        .execute()
+    )
+    rows = list(reversed(r.data if hasattr(r, "data") and r.data else []))
+    out: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or "").strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        content = str(row.get("content") or "")
+        out.append({"role": role, "content": content})
+    return out
 
 
 def delete_conversation(conversation_id: str, user_id: str) -> bool:

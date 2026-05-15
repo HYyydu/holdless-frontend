@@ -127,6 +127,9 @@ User: "I need help with DMV."
 User: "Actually never mind, just tell me the average price."
 → execution_mode: chat, capability: price_quote, domain: pet (escape from call flow)
 
+User (already confirming a phone call): "Can you speak Chinese?" / "你可以说中文吗"
+→ execution_mode: clarify (NOT chat), low confidence, needs_clarification: true — they are switching language, not canceling the call.
+
 User: "Call the store about returning strawberries."
 → execution_mode: call, capability: complaint, domain: retail
 
@@ -299,6 +302,7 @@ def route_flow(
 
     - in_flow: True if already inside a slot-collection flow (so router can detect continue vs escape vs switch).
     - current_flow_type: Current flow_type when in_flow is True (return_service | hospital_pet_quote).
+    - conversation_history: Optional prior turns as {role, content} (newest tail used, up to 8 messages).
     """
     msg = (message or "").strip()
     if not msg:
@@ -325,7 +329,8 @@ def route_flow(
 
     user_content = msg
     if conversation_history:
-        last_few = conversation_history[-4:]
+        # Up to 8 prior messages (four user/assistant exchanges) when provided by caller.
+        last_few = conversation_history[-8:]
         if last_few:
             history_str = "\n".join(
                 f"{m.get('role', 'user')}: {m.get('content', '')}" for m in last_few

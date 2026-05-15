@@ -4,6 +4,7 @@ Uses OpenAI API to generate a short, helpful reply instead of the state machine.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -22,11 +23,17 @@ logger = logging.getLogger(__name__)
 # System prompt: model should answer the user's actual question. Holdless CAN place calls—never say we cannot.
 _SYSTEM = """You are a helpful assistant for Holdless. Holdless CAN place phone calls for users: vet clinics for price quotes, businesses for returns/refunds, or any number with a purpose to gather information (e.g. ask when someone is available).
 Answer what the user actually said. If they ask for a joke, tell a short joke. If they ask who built you, answer briefly. If they say hello, respond in a friendly way.
+When a prior conversation is included, stay consistent with that thread (same task, language preference, or pending action) unless the latest message clearly changes topic.
 Never say you cannot make calls or that you are unable to call. If the user asked to place a call, say we can help (e.g. vet quotes, returns, or call a number to ask something) and briefly say what to do next. Keep it to one or two short sentences. Stay concise and helpful.
 Always reply in the same language the user used (for example Simplified Chinese if they wrote in Chinese, English if they wrote in English)."""
 
 
-def reply_for_no_call_intent(user_message: str, intent: Intent) -> str:
+def reply_for_no_call_intent(
+    user_message: str,
+    intent: Intent,
+    *,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> str:
     """
     Call OpenAI to get a reply when the flow router (or caller) decided no-call.
     Returns a fallback string if the API is unavailable or fails (e.g. OPENAI_API_KEY not set).
@@ -50,15 +57,26 @@ def reply_for_no_call_intent(user_message: str, intent: Intent) -> str:
         "PHONE_NUMBER_ONLY": "The user sent what looks like just a phone number with no request to call.",
     }.get(intent.intent, "The user's message does not require placing a call.")
 
+    history_block = ""
+    if conversation_history:
+        tail = conversation_history[-8:]
+        if tail:
+            lines = "\n".join(
+                f"{m.get('role', 'user')}: {m.get('content', '')}" for m in tail
+            )
+            history_block = f"Prior conversation (oldest first):\n{lines}\n\n"
+
+    user_prompt = (
+        f"{history_block}{intent_desc}\n\nLatest user message:\n{user_message}\n\n"
+        "Reply in one or two sentences in the user's language:"
+    )
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": _SYSTEM},
-                {
-                    "role": "user",
-                    "content": f"{intent_desc}\n\nUser said: {user_message}\n\nReply in one or two sentences in the user's language:",
-                },
+                {"role": "user", "content": user_prompt},
             ],
             max_tokens=150,
             temperature=0.3,
@@ -76,6 +94,93 @@ def reply_for_no_call_intent(user_message: str, intent: Intent) -> str:
     except Exception as e:
         logger.warning("OpenAI API call failed in reply_for_no_call_intent: %s", e, exc_info=True)
     return _fallback_reply(intent)
+
+
+def reply_for_call_confirm_amendment(
+    *,
+    user_message: str,
+    conversation_history: list[dict[str, str]] | None,
+    pending_confirmation_markdown: str,
+    context_facts: dict[str, Any],
+) -> tuple[str, list[str]]:
+    """
+    When the user sends anything other than a bare Yes/No during call confirmation, merge their
+    latest message with the pending call plan using the model. Returns (assistant_reply, extra
+    detail lines to persist on context['call_details']).
+    """
+    client = get_openai_client()
+    if not client:
+        return "", []
+
+    history_block = ""
+    if conversation_history:
+        tail = conversation_history[-10:]
+        if tail:
+            lines = "\n".join(
+                f"{m.get('role', 'user')}: {m.get('content', '')}" for m in tail
+            )
+            history_block = f"Prior conversation (oldest first):\n{lines}\n\n"
+
+    facts = json.dumps(context_facts, ensure_ascii=False, default=str)[:4000]
+
+    system = (
+        "You help users finalize an outbound phone call in Holdless. They already saw a "
+        "confirmation summary and may add details, ask questions, or switch language—do NOT "
+        "tell them to only answer yes or no.\n"
+        "Rules:\n"
+        "- Use the same language as the user's latest message when possible.\n"
+        "- Keep every fact from the current confirmation unless the user clearly corrects it; "
+        "never invent medical/billing numbers not present in the confirmation or facts JSON.\n"
+        "- Integrate new instructions (e.g. name to use on the call, extra dispute points) into "
+        "the visible summary.\n"
+        "- Answer brief meta questions (e.g. can you reply in Chinese) directly, then show the "
+        "updated confirmation.\n"
+        "- End the assistant_reply with a line break and exactly: "
+        "Should I proceed with the call? (Yes/No)\n"
+        "Output JSON only with keys: assistant_reply (string, markdown allowed), "
+        "additional_detail_lines (array of short strings—new instructions for the phone agent "
+        "only; omit lines that merely repeat what's already in the confirmation)."
+    )
+
+    user_prompt = (
+        f"{history_block}"
+        f"Current confirmation (markdown):\n{pending_confirmation_markdown}\n\n"
+        f"Structured facts (JSON):\n{facts}\n\n"
+        f"Latest user message:\n{user_message}\n\n"
+        'Return JSON: {"assistant_reply":"...","additional_detail_lines":["..."]}'
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=900,
+            temperature=0.25,
+            response_format={"type": "json_object"},
+        )
+        choice = (response.choices or [None])[0]
+        content = getattr(choice.message, "content", None) if choice else None
+        if not isinstance(content, str) or not content.strip():
+            return "", []
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            return "", []
+        reply = data.get("assistant_reply")
+        if not isinstance(reply, str) or not reply.strip():
+            return "", []
+        raw_lines = data.get("additional_detail_lines")
+        lines_out: list[str] = []
+        if isinstance(raw_lines, list):
+            for ln in raw_lines:
+                if isinstance(ln, str) and ln.strip():
+                    lines_out.append(ln.strip())
+        return reply.strip(), lines_out
+    except Exception as e:
+        logger.warning("reply_for_call_confirm_amendment failed: %s", e, exc_info=True)
+        return "", []
 
 
 def _fallback_reply(intent: Intent) -> str:

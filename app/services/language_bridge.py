@@ -15,6 +15,21 @@ logger = logging.getLogger(__name__)
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 
+# Short meta-messages ("speak Chinese", "用中文") should not reset an in-progress call flow.
+_LANGUAGE_META_ZH_RE = re.compile(
+    r"(说|讲|用|使用|請|请|改|切|换|換).{0,12}中文"
+    r"|中文.{0,8}(吗|么|嘛|呀|呢|回|说|讲|写)"
+    r"|(会|能|可以).{0,6}中文",
+)
+_LANGUAGE_META_EN_RE = re.compile(
+    r"\b(speak|talk|write|reply|respond|answer|use|switch\s+to)\b.{0,18}\bchinese\b"
+    r"|\bchinese\b.{0,10}\b(please|only|ok\??|thanks?)\b"
+    r"|\bin\s+chinese\b"
+    r"|\bmandarin\b.{0,8}\b(please|ok\??)?\b",
+    re.IGNORECASE,
+)
+_LANGUAGE_META_MAX_LEN = 120
+
 
 def text_has_cjk(text: str) -> bool:
     return bool(text and _CJK_RE.search(text))
@@ -22,6 +37,18 @@ def text_has_cjk(text: str) -> bool:
 
 def text_has_latin(text: str) -> bool:
     return bool(text and _LATIN_RE.search(text))
+
+
+def is_language_locale_meta_message(message: str) -> bool:
+    """True when the turn is only asking to switch reply language (keep active call context)."""
+    msg = (message or "").strip()
+    if not msg or len(msg) > _LANGUAGE_META_MAX_LEN:
+        return False
+    if _LANGUAGE_META_ZH_RE.search(msg):
+        return True
+    if _LANGUAGE_META_EN_RE.search(msg):
+        return True
+    return False
 
 
 def update_reply_locale_from_message(context: dict[str, Any], message: str) -> dict[str, Any]:

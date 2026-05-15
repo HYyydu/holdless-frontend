@@ -734,7 +734,9 @@ async function placeCall(
             : "none",
   );
   if (token && !String(callBackendToken || "").trim() && !debugBearer) {
-    console.log("[Call] Bearer from CALL_API_TOKEN (.env), not request body/header");
+    console.log(
+      "[Call] Bearer from CALL_API_TOKEN (.env), not request body/header",
+    );
   }
   return placeCallViaBackend(normalized, callReason, token, options);
 }
@@ -761,9 +763,9 @@ async function placeCallViaBackend(
       : "";
   const hasRichGuidance = Boolean(
     hintPurpose ||
-      (options.agent_prompt != null && String(options.agent_prompt).trim()) ||
-      (options.opening_line != null && String(options.opening_line).trim()) ||
-      (Array.isArray(options.talking_points) && options.talking_points.length),
+    (options.agent_prompt != null && String(options.agent_prompt).trim()) ||
+    (options.opening_line != null && String(options.opening_line).trim()) ||
+    (Array.isArray(options.talking_points) && options.talking_points.length),
   );
   let purpose = hintPurpose
     ? hintPurpose.slice(0, PURPOSE_SUMMARY_MAX_LENGTH)
@@ -937,12 +939,11 @@ async function placeCallViaBackend(
       code === "ERR_SSL_PACKET_LENGTH_TOO_LONG" ||
       (typeof cause?.message === "string" &&
         cause.message.includes("packet length too long"));
-    const hint =
-      sslPacketTooLong
-        ? " This usually means CALL_BACKEND_URL uses https:// but the server on that host:443 is speaking plain HTTP (wrong scheme), or the tunnel is not an HTTP/S tunnel (use `ngrok http <port>`, not `ngrok tcp`). Try http:// in CALL_BACKEND_URL or fix TLS on the call backend."
-        : code === "ECONNREFUSED" || code === "ENOTFOUND"
-          ? " Check CALL_BACKEND_URL, VPN/firewall, and that the tunnel (e.g. ngrok) is running."
-          : "";
+    const hint = sslPacketTooLong
+      ? " This usually means CALL_BACKEND_URL uses https:// but the server on that host:443 is speaking plain HTTP (wrong scheme), or the tunnel is not an HTTP/S tunnel (use `ngrok http <port>`, not `ngrok tcp`). Try http:// in CALL_BACKEND_URL or fix TLS on the call backend."
+      : code === "ECONNREFUSED" || code === "ENOTFOUND"
+        ? " Check CALL_BACKEND_URL, VPN/firewall, and that the tunnel (e.g. ngrok) is running."
+        : "";
     if (sslPacketTooLong) {
       console.error(
         "[Call] Hint: openssl 'packet length too long' = TLS handshake received non-TLS bytes (HTTP on :443, wrong proxy, or tcp tunnel vs http tunnel).",
@@ -1061,7 +1062,10 @@ async function getCallStatusFromBackend(callId, token) {
         cost: call.cost,
         phone_number: call.phone_number ?? data.phone_number,
         user_joined_at:
-          call.user_joined_at ?? call.userJoinedAt ?? data.user_joined_at ?? null,
+          call.user_joined_at ??
+          call.userJoinedAt ??
+          data.user_joined_at ??
+          null,
         input_tokens: call.input_tokens ?? data.input_tokens,
         output_tokens: call.output_tokens ?? data.output_tokens,
       };
@@ -1487,51 +1491,49 @@ app.post("/api/chat", async (req, res) => {
               ? String(args.name).trim()
               : "Holdless";
           placeCallAlreadyInvoked = true;
-            const purpose = await summarizeChatToPurpose(
-              openaiMessages,
-              args.call_reason,
-            );
-            const callOptions = { name: callName };
-            if (
-              args.voice_preference != null &&
-              String(args.voice_preference).trim()
-            )
-              callOptions.voice_preference = String(
-                args.voice_preference,
-              ).trim();
-            if (
-              args.additional_instructions != null &&
-              String(args.additional_instructions).trim()
-            )
-              callOptions.additional_instructions = String(
-                args.additional_instructions,
-              ).trim();
-            console.log(
-              "[Call] place_call invoked | phone:",
-              args.phone_number,
-              "| name:",
-              callName,
-              "| purpose length:",
-              purpose.length,
-            );
-            const callResult = await placeCall(
-              args.phone_number,
-              purpose,
-              callBackendToken,
-              callOptions,
-            );
-            console.log(
-              "[Call] place_call result:",
-              callResult.callId
-                ? { callId: callResult.callId, status: callResult.status }
-                : { error: callResult.error },
-            );
-            if (callResult.callId) {
-              lastCallId = callResult.callId;
-              lastCallReason = callResult.callReason || purpose;
-              lastCallDomain = callResult.domain ?? null;
-            }
-            toolResult = JSON.stringify(callResult);
+          const purpose = await summarizeChatToPurpose(
+            openaiMessages,
+            args.call_reason,
+          );
+          const callOptions = { name: callName };
+          if (
+            args.voice_preference != null &&
+            String(args.voice_preference).trim()
+          )
+            callOptions.voice_preference = String(args.voice_preference).trim();
+          if (
+            args.additional_instructions != null &&
+            String(args.additional_instructions).trim()
+          )
+            callOptions.additional_instructions = String(
+              args.additional_instructions,
+            ).trim();
+          console.log(
+            "[Call] place_call invoked | phone:",
+            args.phone_number,
+            "| name:",
+            callName,
+            "| purpose length:",
+            purpose.length,
+          );
+          const callResult = await placeCall(
+            args.phone_number,
+            purpose,
+            callBackendToken,
+            callOptions,
+          );
+          console.log(
+            "[Call] place_call result:",
+            callResult.callId
+              ? { callId: callResult.callId, status: callResult.status }
+              : { error: callResult.error },
+          );
+          if (callResult.callId) {
+            lastCallId = callResult.callId;
+            lastCallReason = callResult.callReason || purpose;
+            lastCallDomain = callResult.domain ?? null;
+          }
+          toolResult = JSON.stringify(callResult);
         }
       } else {
         toolResult = JSON.stringify({ error: "Unknown or invalid tool call" });
