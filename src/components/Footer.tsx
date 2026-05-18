@@ -7,7 +7,7 @@ const Footer = () => {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <img 
-              src="/assets/holdless-logo-icon.png" 
+              src="/assets/holdless_logo_transparent.png" 
               alt="Holdless logo" 
               className="w-6 h-6"
             />

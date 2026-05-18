@@ -1004,7 +1004,7 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     <div className="flex gap-4">
       <div className="w-8 h-8 rounded-full overflow-hidden flex-shrink-0">
         <img
-          src="/assets/holdless-logo-icon.png"
+          src="/assets/holdless_logo_transparent.png"
           alt="Holdless"
           className="w-full h-full object-cover"
         />
@@ -1039,7 +1039,7 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     <div className="flex gap-4">
       <div className="w-8 h-8 rounded-full overflow-hidden flex-shrink-0">
         <img
-          src="/assets/holdless-logo-icon.png"
+          src="/assets/holdless_logo_transparent.png"
           alt="Holdless"
           className="w-full h-full object-cover"
         />
@@ -1526,7 +1526,7 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
                     <img
                       alt="Holdless"
                       className="w-full h-full object-cover"
-                      src="/assets/holdless-logo-icon.png"
+                      src="/assets/holdless_logo_transparent.png"
                     />
                   </div>
                 )}

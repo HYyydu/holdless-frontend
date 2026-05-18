@@ -36,7 +36,7 @@ const Landing = () => {
             <img
               alt="Holdless logo"
               className="w-14 h-14 object-contain object-right"
-              src="/assets/holdless-logo-icon.png"
+              src="/assets/holdless_logo_transparent.png"
             />
             <span className="text-xl font-bold tracking-tight text-sidebar-foreground -ml-2">
               Holdless

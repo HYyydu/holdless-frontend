@@ -176,7 +176,7 @@ export function HoldlessWinModal({ open, onOpenChange, winData }: HoldlessWinMod
             {/* Logo & Tagline */}
             <div className="flex items-center gap-2 mb-4">
               <img 
-                src="/assets/holdless-logo-icon.png" 
+                src="/assets/holdless_logo_transparent.png" 
                 alt="Holdless" 
                 className="w-8 h-8 rounded-lg shadow-md"
               />

@@ -35,7 +35,7 @@ export function Header({ activeTab, onTabChange, pendingTasksCount }: HeaderProp
             onClick={handleLogoClick}
           >
             <img 
-              src="/assets/holdless-logo-icon.png" 
+              src="/assets/holdless_logo_transparent.png" 
               alt="Holdless logo" 
               className="w-10 h-10"
             />

@@ -41,7 +41,7 @@ export function DashboardSidebar({
   }}>
       {/* Logo */}
       <div className={cn("flex items-center cursor-pointer transition-all duration-300 opacity-100", collapsed ? "justify-center py-5" : "px-5 py-5")} onClick={() => navigate('/')}>
-        <img alt="Holdless" className={cn("object-contain transition-all duration-300", collapsed ? "w-10 h-10" : "w-12 h-12")} src="/assets/holdless-logo-icon.png" />
+        <img alt="Holdless" className={cn("object-contain transition-all duration-300", collapsed ? "w-10 h-10" : "w-12 h-12")} src="/assets/holdless_logo_transparent.png" />
         <span className={cn("text-lg font-semibold text-sidebar-foreground transition-all duration-300 overflow-hidden whitespace-nowrap -ml-1", collapsed ? "w-0 opacity-0" : "w-auto opacity-100")}>
           Holdless
         </span>
