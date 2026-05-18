@@ -1933,6 +1933,10 @@ if (serveSpa) {
   app.use(express.static(distPath));
   app.get("*", (req, res, next) => {
     if (req.path.startsWith("/api")) return next();
+    // Missing static files must 404 — returning index.html breaks <img src="*.png">.
+    if (path.extname(req.path)) {
+      return res.status(404).send("Not found");
+    }
     res.sendFile(spaIndex, (err) => (err ? next(err) : undefined));
   });
 }
