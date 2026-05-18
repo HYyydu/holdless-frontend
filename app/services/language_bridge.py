@@ -29,6 +29,11 @@ _LANGUAGE_META_EN_RE = re.compile(
     re.IGNORECASE,
 )
 _LANGUAGE_META_MAX_LEN = 120
+# Short yes/no/ok — keep session locale; do not treat as a full English prompt.
+_SHORT_NEUTRAL_RE = re.compile(
+    r"^(yes|no|yep|nope|ok|okay|sure|thanks?|thank\s+you|是|否|好|嗯|对|没问题)[.!?]*$",
+    re.IGNORECASE,
+)
 
 
 def text_has_cjk(text: str) -> bool:
@@ -51,27 +56,44 @@ def is_language_locale_meta_message(message: str) -> bool:
     return False
 
 
-def update_reply_locale_from_message(context: dict[str, Any], message: str) -> dict[str, Any]:
-    """Persist preferred UI language from the latest user turn.
+def detect_message_locale(message: str, context: dict[str, Any] | None = None) -> str:
+    """Locale for assistant replies: match the user's latest prompt when possible.
 
-    Rules:
-    - Any CJK in the message -> zh
-    - Any Latin letters (and no CJK) -> en
-    - Digits/symbol-only text keeps previous locale
+    - CJK in message -> zh
+    - Latin letters only -> en
+    - Neutral (yes/no, digits) -> prior reply_locale, else en
     """
+    msg = (message or "").strip()
+    if text_has_cjk(msg):
+        return "zh"
+    if text_has_latin(msg):
+        if _SHORT_NEUTRAL_RE.match(msg):
+            prior = (context or {}).get("reply_locale") or ""
+            if prior in ("zh", "en"):
+                return prior
+        return "en"
+    prior = (context or {}).get("reply_locale") or ""
+    if prior in ("zh", "en"):
+        return prior
+    return "en"
+
+
+def update_reply_locale_from_message(context: dict[str, Any], message: str) -> dict[str, Any]:
+    """Persist preferred UI language from the latest user turn."""
     if not (message or "").strip():
         return context
-    if text_has_cjk(message):
-        return {**context, "reply_locale": "zh"}
-    if text_has_latin(message):
-        return {**context, "reply_locale": "en"}
-    return context
+    locale = detect_message_locale(message, context)
+    if locale == (context.get("reply_locale") or ""):
+        return context
+    return {**context, "reply_locale": locale}
 
 
 def should_localize_to_chinese(context: dict[str, Any], message: str) -> bool:
-    if text_has_cjk(message):
-        return True
-    return (context.get("reply_locale") or "") == "zh"
+    return detect_message_locale(message, context) == "zh"
+
+
+def should_localize_to_english(context: dict[str, Any], message: str) -> bool:
+    return detect_message_locale(message, context) == "en"
 
 
 def localize_assistant_reply(reply: str, *, user_message: str) -> str:
@@ -108,6 +130,62 @@ def localize_assistant_reply(reply: str, *, user_message: str) -> str:
             return content.strip()
     except Exception as e:
         logger.warning("localize_assistant_reply failed: %s", e, exc_info=True)
+    return reply
+
+
+def localize_assistant_reply_to_english(reply: str, *, user_message: str) -> str:
+    """Translate an assistant reply to natural English when the user wrote in English."""
+    if not (reply or "").strip():
+        return reply
+    client = get_openai_client()
+    if not client:
+        return reply
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate the assistant message to natural English. "
+                        "Keep E.164 phone numbers, digits, and proper names unchanged. "
+                        "Keep (Yes/No) or (yes/no) prompts understandable. "
+                        "Preserve line breaks and bullet structure. Output only the translation, no preamble."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"User (tone reference):\n{user_message[:600]}\n\nAssistant reply:\n{reply}",
+                },
+            ],
+            max_tokens=700,
+            temperature=0.2,
+        )
+        choice = (response.choices or [None])[0]
+        content = getattr(choice.message, "content", None) if choice else None
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    except Exception as e:
+        logger.warning("localize_assistant_reply_to_english failed: %s", e, exc_info=True)
+    return reply
+
+
+def ensure_reply_matches_user_language(
+    reply: str,
+    *,
+    user_message: str,
+    context: dict[str, Any] | None = None,
+) -> str:
+    """Rule 1: assistant text matches the user's prompt language (current turn)."""
+    if not (reply or "").strip():
+        return reply
+    locale = detect_message_locale(user_message, context)
+    if locale == "zh":
+        if not text_has_cjk(reply) and text_has_latin(reply):
+            return localize_assistant_reply(reply, user_message=user_message)
+    elif locale == "en":
+        if text_has_cjk(reply):
+            return localize_assistant_reply_to_english(reply, user_message=user_message)
     return reply
 
 

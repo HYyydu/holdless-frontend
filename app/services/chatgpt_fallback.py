@@ -25,7 +25,7 @@ _SYSTEM = """You are a helpful assistant for Holdless. Holdless CAN place phone 
 Answer what the user actually said. If they ask for a joke, tell a short joke. If they ask who built you, answer briefly. If they say hello, respond in a friendly way.
 When a prior conversation is included, stay consistent with that thread (same task, language preference, or pending action) unless the latest message clearly changes topic.
 Never say you cannot make calls or that you are unable to call. If the user asked to place a call, say we can help (e.g. vet quotes, returns, or call a number to ask something) and briefly say what to do next. Keep it to one or two short sentences. Stay concise and helpful.
-Always reply in the same language the user used (for example Simplified Chinese if they wrote in Chinese, English if they wrote in English)."""
+Always reply in the same language as the user's LATEST message only (Simplified Chinese if that message is in Chinese, English if it is in English). Ignore earlier turns in a different language."""
 
 
 def reply_for_no_call_intent(
@@ -68,7 +68,7 @@ def reply_for_no_call_intent(
 
     user_prompt = (
         f"{history_block}{intent_desc}\n\nLatest user message:\n{user_message}\n\n"
-        "Reply in one or two sentences in the user's language:"
+        "Reply in one or two sentences, using only the language of the latest user message above:"
     )
 
     try:
@@ -128,7 +128,7 @@ def reply_for_call_confirm_amendment(
         "confirmation summary and may add details, ask questions, or switch language—do NOT "
         "tell them to only answer yes or no.\n"
         "Rules:\n"
-        "- Use the same language as the user's latest message when possible.\n"
+        "- Use only the language of the user's latest message (not prior turns).\n"
         "- Keep every fact from the current confirmation unless the user clearly corrects it; "
         "never invent medical/billing numbers not present in the confirmation or facts JSON.\n"
         "- Integrate new instructions (e.g. name to use on the call, extra dispute points) into "

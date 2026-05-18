@@ -105,6 +105,9 @@ def _is_insurance_quote_intent(text: str) -> bool:
         "marketplace",
         "compare",
         "shopping",
+        "buy",
+        "purchase",
+        "affordable",
     )
     return any(sig in low for sig in quote_signals)
 

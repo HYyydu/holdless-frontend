@@ -767,12 +767,11 @@ async function placeCallViaBackend(
     (options.opening_line != null && String(options.opening_line).trim()) ||
     (Array.isArray(options.talking_points) && options.talking_points.length),
   );
-  let purpose = hintPurpose
-    ? hintPurpose.slice(0, PURPOSE_SUMMARY_MAX_LENGTH)
-    : (await translateToEnglish(rawPurpose)).slice(
-        0,
-        PURPOSE_SUMMARY_MAX_LENGTH,
-      );
+  const purposeSource = hintPurpose || rawPurpose;
+  let purpose = (await translateToEnglish(purposeSource)).slice(
+    0,
+    PURPOSE_SUMMARY_MAX_LENGTH,
+  );
   // Intent classification runs before every call (domain, task, confidence for routing/tagging).
   // Skip when Python already sent agent_prompt / opening_line — insurance intent routing can
   // override consumer role and sound like a representative.
@@ -811,8 +810,8 @@ async function placeCallViaBackend(
     options.additional_instructions != null &&
     String(options.additional_instructions).trim()
   ) {
-    body.additional_instructions = String(
-      options.additional_instructions,
+    body.additional_instructions = (
+      await translateToEnglish(String(options.additional_instructions))
     ).trim();
   }
   if (options.opening_line != null && String(options.opening_line).trim()) {

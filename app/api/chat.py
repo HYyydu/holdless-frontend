@@ -24,8 +24,7 @@ from app.services.conversation_persistence import (
 from app.services.conversation_store import load, save, create_new
 from app.services.chatgpt_fallback import Intent, reply_for_no_call_intent
 from app.services.language_bridge import (
-    localize_assistant_reply,
-    should_localize_to_chinese,
+    ensure_reply_matches_user_language,
     update_reply_locale_from_message,
 )
 from app.services.flow_router import (
@@ -117,13 +116,44 @@ _HAS_LOCATION_HINT_RE = re.compile(
 )
 _ZIP_RE = re.compile(r"(?<!\d)(\d{5}(?:-\d{4})?)(?!\d)")
 _INSURANCE_SEARCH_RE = re.compile(
-    r"(insurance|health\s*insurance|medical\s*insurance|医保|保险)"
-    r".*(search|find|look\s*for|best|top|compare|推荐|搜索|找|对比)"
+    # Explicit search / compare / quote
+    r"(insurance|health\s*insurance|medical\s*insurance|health\s*plan|医保|保险)"
+    r".*(search|find|look\s*for|best|top|compare|quote|推荐|搜索|找|对比)"
     r"|"
-    r"(search|find|look\s*for|best|top|compare|推荐|搜索|找|对比)"
-    r".*(insurance|health\s*insurance|medical\s*insurance|医保|保险)",
+    r"(search|find|look\s*for|best|top|compare|quote|推荐|搜索|找|对比)"
+    r".*(insurance|health\s*insurance|medical\s*insurance|health\s*plan|医保|保险)"
+    r"|"
+    # Purchase / plan shopping (e.g. "I want to buy medical insurance, which is affordable")
+    r"\b(?:buy|purchase|get|shop(?:ping)?|enroll(?:ing)?|sign\s*up|want|need)\b.{0,120}"
+    r"\b(?:health\s*)?(?:medical\s*)?insurance\b"
+    r"|"
+    r"\b(?:health\s*)?(?:medical\s*)?insurance\b.{0,120}"
+    r"\b(?:buy|purchase|quote|premium|affordable|cheap|good|best|compare|enroll|plan|options?|which|recommend)\b",
     re.IGNORECASE,
 )
+
+
+def _message_wants_insurance_search(
+    message: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> bool:
+    """True when the user wants to find/compare health insurance and call for quotes."""
+    if _INSURANCE_SEARCH_RE.search(message or ""):
+        return True
+    if not conversation_history:
+        return False
+    # Follow-up after an earlier insurance-shopping turn (e.g. user adds ZIP or "yes, call them").
+    for turn in reversed(conversation_history):
+        role = (turn.get("role") or "").strip().lower()
+        if role != "user":
+            continue
+        prior = (turn.get("content") or "").strip()
+        if prior and _INSURANCE_SEARCH_RE.search(prior):
+            cur = (message or "").strip()
+            if cur and len(cur) <= 120:
+                return True
+        break
+    return False
 _BILL_DISPUTE_RE = re.compile(
     r"(dispute\s+(?:my\s+|this\s+|the\s+|a\s+)?bill|billing\s+issue|bill(?:ing)?\s+problem|账单|争议账单|账单纠纷)",
     re.IGNORECASE,
@@ -971,7 +1001,9 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                     searched_options,
                 )
 
-    if new_state is None and at_entry_no_flow and _INSURANCE_SEARCH_RE.search(message or ""):
+    if new_state is None and at_entry_no_flow and _message_wants_insurance_search(
+        message, conversation_history or None
+    ):
         searched = _insurance_search_reply(message)
         if searched:
             searched_reply, searched_options = searched
@@ -1258,8 +1290,10 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
 
     base_context = updated_context if updated_context is not None else context
     merged_context = update_reply_locale_from_message(dict(base_context), raw_message)
-    if reply_text and should_localize_to_chinese(merged_context, raw_message):
-        reply_text = localize_assistant_reply(reply_text, user_message=raw_message)
+    if reply_text:
+        reply_text = ensure_reply_matches_user_language(
+            reply_text, user_message=raw_message, context=merged_context
+        )
     persisted_context = _context_for_redis(merged_context)
     save(conversation_id, user_id, new_state, persisted_context)
 

@@ -20,6 +20,18 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_INSURANCE_SHOPPING_HINT_RE = re.compile(
+    r"\b(?:buy|purchase|get|shop(?:ping)?|enroll(?:ing)?|sign\s*up|want|need)\b.{0,120}"
+    r"\b(?:health\s*)?(?:medical\s*)?insurance\b"
+    r"|"
+    r"\b(?:health\s*)?(?:medical\s*)?insurance\b.{0,120}"
+    r"\b(?:buy|purchase|quote|premium|affordable|cheap|good|best|compare|enroll|plan|options?|which|recommend)\b"
+    r"|"
+    r"(search|find|look\s*for|best|top|compare|quote).{0,80}"
+    r"(?:health\s*)?(?:medical\s*)?insurance",
+    re.IGNORECASE,
+)
+
 _BILLING_DISPUTE_HINT_RE = re.compile(
     r"(fix\s+claim\s+or\s+billing\s+issues?)|"
     r"(billing\s+issues?)|"
@@ -307,6 +319,20 @@ def route_flow(
     msg = (message or "").strip()
     if not msg:
         return None
+
+    # Deterministic fast-path for health-insurance shopping / quote requests.
+    # Layer 1 often classifies "which insurance is good/affordable" as chat; chat.py
+    # runs insurance web search before route_flow when this matches.
+    if _INSURANCE_SHOPPING_HINT_RE.search(msg) and not _BILLING_DISPUTE_HINT_RE.search(msg):
+        return Layer1Route(
+            execution_mode=EXECUTION_HYBRID,
+            capability=CAPABILITY_PRICE_QUOTE,
+            domain=DOMAIN_INSURANCE,
+            confidence=0.9,
+            reasoning="User wants to find or compare health insurance plans and get quotes.",
+            needs_clarification=False,
+            multi_intent=False,
+        )
 
     # Deterministic fast-path for insurance billing dispute intent to avoid
     # LLM under-classifying short UI-trigger phrases like

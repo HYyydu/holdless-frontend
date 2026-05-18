@@ -249,7 +249,8 @@ def build_call_backend_payload(
     purpose = purpose_to_english_for_call_api(purpose) or purpose
 
     caller = (caller_name or "").strip() or "Holdless"
-    extra = (additional_instructions or "").strip()[:CALL_ADDITIONAL_INSTRUCTIONS_MAX]
+    extra_raw = (additional_instructions or "").strip()[:CALL_ADDITIONAL_INSTRUCTIONS_MAX]
+    extra = purpose_to_english_for_call_api(extra_raw) if extra_raw else ""
     # Confirmation shows Purpose plus bullets from call_details; include both so chunks match the UI.
     combined_for_points = "\n".join(x for x in (purpose.strip(), extra) if x).strip()
     talking_points = _build_talking_points(
