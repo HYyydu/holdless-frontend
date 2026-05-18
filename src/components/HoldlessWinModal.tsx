@@ -80,7 +80,7 @@ export function HoldlessWinModal({ open, onOpenChange, winData }: HoldlessWinMod
 
   const shareText = `🎉 ${winData.headline}! Holdless saved me ${winData.timeSaved} and ${winData.moneySaved || winData.moneyRecovered || winData.bestQuote || 'got the job done'}. Never wait on hold again! #Holdless`;
   
-  const shareUrl = "https://holdless.lovable.app";
+  const shareUrl = "https://holdless-ai.com";
 
   const handleShare = (platform: string) => {
     const encodedText = encodeURIComponent(shareText);
@@ -176,7 +176,7 @@ export function HoldlessWinModal({ open, onOpenChange, winData }: HoldlessWinMod
             {/* Logo & Tagline */}
             <div className="flex items-center gap-2 mb-4">
               <img 
-                src="/assets/holdless-logo.svg" 
+                src="/assets/holdless-logo-icon.png" 
                 alt="Holdless" 
                 className="w-8 h-8 rounded-lg shadow-md"
               />

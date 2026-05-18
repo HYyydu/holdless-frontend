@@ -1,7 +1,6 @@
 import { cn } from '@/lib/utils';
 import { MessageSquare, CheckSquare, User, Settings, Coins } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import holdlessHLogo from '@/assets/holdless-h-logo-new.png';
 export type DashboardTab = 'ai-chat' | 'tasks' | 'tokens' | 'profile' | 'settings';
 interface DashboardSidebarProps {
   activeTab: DashboardTab;
@@ -42,7 +41,7 @@ export function DashboardSidebar({
   }}>
       {/* Logo */}
       <div className={cn("flex items-center cursor-pointer transition-all duration-300 opacity-100", collapsed ? "justify-center py-5" : "px-5 py-5")} onClick={() => navigate('/')}>
-        <img alt="Holdless" className={cn("object-contain transition-all duration-300", collapsed ? "w-10 h-10" : "w-12 h-12")} src="/lovable-uploads/3a2790b3-313f-4b8f-a724-13962a845d82.png" />
+        <img alt="Holdless" className={cn("object-contain transition-all duration-300", collapsed ? "w-10 h-10" : "w-12 h-12")} src="/assets/holdless-logo-icon.png" />
         <span className={cn("text-lg font-semibold text-sidebar-foreground transition-all duration-300 overflow-hidden whitespace-nowrap -ml-1", collapsed ? "w-0 opacity-0" : "w-auto opacity-100")}>
           Holdless
         </span>
