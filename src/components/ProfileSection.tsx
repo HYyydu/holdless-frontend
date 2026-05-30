@@ -11,6 +11,8 @@ import {
   Calendar,
   IdCard
 } from "lucide-react";
+import { MedicalInsuranceSection } from "@/components/MedicalInsuranceSection";
+import type { UserProfile } from "@/hooks/useUserProfile";
 
 // US States for dropdown
 const usStates = [
@@ -25,22 +27,18 @@ const usStates = [
 ];
 
 interface ProfileSectionProps {
-  profile: {
-    firstName: string;
-    lastName: string;
-    email: string;
-    phone: string;
-    address: string;
-    dateOfBirth: string;
-    state: string;
-    zipCode: string;
-    tone: string;
-    language: string;
-  };
+  profile: UserProfile;
   onUpdateProfile: (field: string, value: string) => void;
+  onUpdateMultipleFields?: (updates: Partial<UserProfile>) => void;
+  userId?: string | null;
 }
 
-export function ProfileSection({ profile, onUpdateProfile }: ProfileSectionProps) {
+export function ProfileSection({
+  profile,
+  onUpdateProfile,
+  onUpdateMultipleFields,
+  userId = null,
+}: ProfileSectionProps) {
   return (
     <div className="space-y-6">
       {/* Personal Information */}
@@ -195,6 +193,13 @@ export function ProfileSection({ profile, onUpdateProfile }: ProfileSectionProps
           </div>
         </CardContent>
       </Card>
+
+      <MedicalInsuranceSection
+        profile={profile}
+        onUpdateProfile={onUpdateProfile}
+        onUpdateMultiple={onUpdateMultipleFields}
+        userId={userId}
+      />
 
       {/* Privacy & Security */}
       <Card className="shadow-card">

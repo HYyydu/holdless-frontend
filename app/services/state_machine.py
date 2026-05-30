@@ -256,6 +256,18 @@ def _extract_call_reason(msg: str) -> str | None:
         if extracted:
             return f"Ask whether {extracted}"[:120]
     # Scheduling / appointment phrasing (before generic "for/about" and before "call them" as delivery)
+    # Capture the full phrase (verb + time/details), not only the tail after "appointment"
+    # (e.g. "schedule an appointment at 1pm today", not just "at 1pm today").
+    full_appointment = re.search(
+        r"\b((?:make|book|schedule)\s+an?\s+appointment"
+        r"(?:\s+(?:for|at|on|to|in\s+getting)\b.+)?)",
+        m,
+        re.IGNORECASE,
+    )
+    if full_appointment:
+        extracted = _strip_phone_numbers(full_appointment.group(1).strip())
+        if extracted:
+            return extracted[:120]
     appointment_first = [
         r"(?:make|book|schedule)\s+an?\s+appointment(?:\s+for|\s+in\s+getting|\s+to\s+get)?\s+(.+)",
         r"(?:make|book|schedule)\s+an?\s+appointment\s+to\s+(.+)",

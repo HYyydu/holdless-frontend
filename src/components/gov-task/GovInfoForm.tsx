@@ -3,7 +3,13 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { Calendar, Save, User, Sparkles } from "lucide-react";
 import { GovProfile } from "@/hooks/useGovProfiles";
@@ -11,14 +17,57 @@ import { useUserProfile } from "@/hooks/useUserProfile";
 
 // US States for dropdown
 const usStates = [
-  "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", 
-  "Delaware", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", 
-  "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", 
-  "Minnesota", "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", 
-  "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio", 
-  "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota", 
-  "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington", "West Virginia", 
-  "Wisconsin", "Wyoming", "District of Columbia"
+  "Alabama",
+  "Alaska",
+  "Arizona",
+  "Arkansas",
+  "California",
+  "Colorado",
+  "Connecticut",
+  "Delaware",
+  "Florida",
+  "Georgia",
+  "Hawaii",
+  "Idaho",
+  "Illinois",
+  "Indiana",
+  "Iowa",
+  "Kansas",
+  "Kentucky",
+  "Louisiana",
+  "Maine",
+  "Maryland",
+  "Massachusetts",
+  "Michigan",
+  "Minnesota",
+  "Mississippi",
+  "Missouri",
+  "Montana",
+  "Nebraska",
+  "Nevada",
+  "New Hampshire",
+  "New Jersey",
+  "New Mexico",
+  "New York",
+  "North Carolina",
+  "North Dakota",
+  "Ohio",
+  "Oklahoma",
+  "Oregon",
+  "Pennsylvania",
+  "Rhode Island",
+  "South Carolina",
+  "South Dakota",
+  "Tennessee",
+  "Texas",
+  "Utah",
+  "Vermont",
+  "Virginia",
+  "Washington",
+  "West Virginia",
+  "Wisconsin",
+  "Wyoming",
+  "District of Columbia",
 ];
 
 // License issue types for Driver's License
@@ -30,7 +79,7 @@ const licenseIssueTypes = [
   "Address change",
   "Upgrade/Endorsement",
   "Reinstatement",
-  "Other"
+  "Other",
 ];
 
 interface GovInfoFormProps {
@@ -89,7 +138,7 @@ export function GovInfoForm({
 }: GovInfoFormProps) {
   // Access global user profile for "Use Profile Info"
   const { profile: userProfile, hasEssentialInfo } = useUserProfile();
-  
+
   const handleUseProfileInfo = () => {
     if (userProfile) {
       setFullName(userProfile.name);
@@ -98,14 +147,16 @@ export function GovInfoForm({
       setZipCode(userProfile.zipCode);
     }
   };
-  
+
   return (
     <div className="space-y-6">
       {/* Required Section */}
       <div className="space-y-4">
         <div className="flex items-center justify-between gap-3">
-          <Badge variant="destructive" className="text-xs font-medium">Required</Badge>
-          
+          <Badge variant="destructive" className="text-xs font-medium">
+            Required
+          </Badge>
+
           {/* Use Profile Info Button - Primary autofill from main profile */}
           {hasEssentialInfo && (
             <Button
@@ -120,14 +171,17 @@ export function GovInfoForm({
             </Button>
           )}
         </div>
-        
+
         <div className="space-y-4">
           {/* Full Legal Name */}
           <div className="space-y-2">
-            <Label htmlFor="gov-full-name" className="text-sm font-medium text-foreground">
+            <Label
+              htmlFor="gov-full-name"
+              className="text-sm font-medium text-foreground"
+            >
               Full Legal Name
             </Label>
-            <Input 
+            <Input
               id="gov-full-name"
               placeholder="Enter your full legal name"
               value={fullName}
@@ -135,14 +189,17 @@ export function GovInfoForm({
               className="h-11 border-border/60 focus:border-primary/50 focus:ring-primary/20 transition-all"
             />
           </div>
-          
+
           {/* Date of Birth */}
           <div className="space-y-2">
-            <Label htmlFor="gov-dob" className="text-sm font-medium text-foreground flex items-center gap-2">
+            <Label
+              htmlFor="gov-dob"
+              className="text-sm font-medium text-foreground flex items-center gap-2"
+            >
               <Calendar className="w-4 h-4 text-muted-foreground" />
               Date of Birth
             </Label>
-            <Input 
+            <Input
               id="gov-dob"
               type="date"
               value={dateOfBirth}
@@ -150,13 +207,21 @@ export function GovInfoForm({
               className="h-11 border-border/60 focus:border-primary/50 focus:ring-primary/20 transition-all"
             />
           </div>
-          
+
           {/* State & ZIP Row */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="gov-state" className="text-sm font-medium text-foreground">State</Label>
+              <Label
+                htmlFor="gov-state"
+                className="text-sm font-medium text-foreground"
+              >
+                State
+              </Label>
               <Select value={state} onValueChange={setState}>
-                <SelectTrigger id="gov-state" className="h-11 border-border/60 focus:border-primary/50">
+                <SelectTrigger
+                  id="gov-state"
+                  className="h-11 border-border/60 focus:border-primary/50"
+                >
                   <SelectValue placeholder="Select your state" />
                 </SelectTrigger>
                 <SelectContent>
@@ -168,10 +233,15 @@ export function GovInfoForm({
                 </SelectContent>
               </Select>
             </div>
-            
+
             <div className="space-y-2">
-              <Label htmlFor="gov-zip" className="text-sm font-medium text-foreground">ZIP Code</Label>
-              <Input 
+              <Label
+                htmlFor="gov-zip"
+                className="text-sm font-medium text-foreground"
+              >
+                ZIP Code
+              </Label>
+              <Input
                 id="gov-zip"
                 placeholder="e.g. 10001"
                 value={zipCode}
@@ -183,20 +253,30 @@ export function GovInfoForm({
           </div>
         </div>
       </div>
-      
+
       {/* Optional Section */}
       <div className="space-y-4 pt-4 border-t border-border/50">
         <div className="flex items-center gap-2">
-          <Badge variant="secondary" className="text-xs font-medium bg-muted/80">Optional</Badge>
-          <span className="text-xs text-muted-foreground">Helps speed up the call</span>
+          <Badge
+            variant="secondary"
+            className="text-xs font-medium bg-muted/80"
+          >
+            Optional
+          </Badge>
+          <span className="text-xs text-muted-foreground">
+            Helps speed up the call
+          </span>
         </div>
-        
+
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-2">
-            <Label htmlFor="gov-license-number" className="text-sm font-medium text-foreground">
+            <Label
+              htmlFor="gov-license-number"
+              className="text-sm font-medium text-foreground"
+            >
               Driver's License Number
             </Label>
-            <Input 
+            <Input
               id="gov-license-number"
               placeholder="Enter your license number"
               value={licenseNumber}
@@ -204,13 +284,22 @@ export function GovInfoForm({
               className="h-11 border-border/60 focus:border-primary/50 focus:ring-primary/20 transition-all"
             />
           </div>
-          
+
           <div className="space-y-2">
-            <Label htmlFor="gov-license-issue" className="text-sm font-medium text-foreground">
+            <Label
+              htmlFor="gov-license-issue"
+              className="text-sm font-medium text-foreground"
+            >
               Type of License Issue
             </Label>
-            <Select value={licenseIssueType} onValueChange={setLicenseIssueType}>
-              <SelectTrigger id="gov-license-issue" className="h-11 border-border/60 focus:border-primary/50">
+            <Select
+              value={licenseIssueType}
+              onValueChange={setLicenseIssueType}
+            >
+              <SelectTrigger
+                id="gov-license-issue"
+                className="h-11 border-border/60 focus:border-primary/50"
+              >
                 <SelectValue placeholder="Select issue type" />
               </SelectTrigger>
               <SelectContent>
@@ -224,18 +313,23 @@ export function GovInfoForm({
           </div>
         </div>
       </div>
-      
+
       {/* Call Goal Section */}
       <div className="space-y-4 pt-4 border-t border-border/50">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-foreground">Call Goal</span>
-          <Badge variant="secondary" className="text-xs font-medium bg-muted/80">Optional</Badge>
+          <Badge
+            variant="secondary"
+            className="text-xs font-medium bg-muted/80"
+          >
+            Optional
+          </Badge>
         </div>
         <p className="text-xs text-muted-foreground -mt-2">
           Helps the agent understand your priorities
         </p>
-        
-        <Textarea 
+
+        <Textarea
           id="gov-call-goal"
           placeholder="What do you want to achieve? e.g. Renew my license before it expires next month"
           value={callGoal}
@@ -248,10 +342,12 @@ export function GovInfoForm({
       {showSaveOption && (
         <div className="space-y-3 pt-4 border-t border-border/50">
           <div className="flex items-center space-x-3">
-            <Checkbox 
-              id="save-profile" 
+            <Checkbox
+              id="save-profile"
               checked={saveAsProfile}
-              onCheckedChange={(checked) => setSaveAsProfile(checked as boolean)}
+              onCheckedChange={(checked) =>
+                setSaveAsProfile(checked as boolean)
+              }
               className="border-border/60"
             />
             <label
@@ -262,13 +358,16 @@ export function GovInfoForm({
               Save this information for future tasks
             </label>
           </div>
-          
+
           {saveAsProfile && (
             <div className="space-y-2 pl-7">
-              <Label htmlFor="profile-name" className="text-sm font-medium text-foreground">
+              <Label
+                htmlFor="profile-name"
+                className="text-sm font-medium text-foreground"
+              >
                 Profile Name
               </Label>
-              <Input 
+              <Input
                 id="profile-name"
                 placeholder="e.g. My Profile, John's Info"
                 value={profileName}

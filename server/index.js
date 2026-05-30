@@ -1067,6 +1067,13 @@ async function getCallStatusFromBackend(callId, token) {
           null,
         input_tokens: call.input_tokens ?? data.input_tokens,
         output_tokens: call.output_tokens ?? data.output_tokens,
+        recording_url: call.recording_url ?? data.recording_url ?? null,
+        has_recording: Boolean(
+          call.recording_url ??
+            data.recording_url ??
+            data.has_recording ??
+            call.has_recording,
+        ),
       };
     } catch (err) {
       clearTimeout(timeoutId);
@@ -1865,6 +1872,67 @@ app.post("/api/calls/:callId/join", async (req, res) => {
   } catch (err) {
     console.error("[Call] POST /api/calls/:callId/join error:", err.message);
     res
+      .status(502)
+      .json({ error: "Call backend unavailable", detail: err.message });
+  }
+});
+
+// GET /api/calls/:callId/recording - Stream call recording (proxied from call backend).
+app.get("/api/calls/:callId/recording", async (req, res) => {
+  const { callId } = req.params;
+  if (!callId) {
+    return res.status(400).json({ error: "callId required" });
+  }
+  if (!USE_CALL_BACKEND) {
+    return res
+      .status(503)
+      .json({ error: "Call backend not configured. Set CALL_BACKEND_URL." });
+  }
+  const token =
+    req.headers?.authorization &&
+    req.headers.authorization.startsWith("Bearer ")
+      ? req.headers.authorization.slice(7).trim()
+      : CALL_API_TOKEN;
+  if (!token && !CALL_BACKEND_ALLOW_NO_AUTH) {
+    return res.status(401).json({
+      error: "Authorization required. Send Bearer token or set CALL_API_TOKEN.",
+    });
+  }
+  const url = `${CALL_BACKEND_URL}/api/calls/${callId}/recording`;
+  const headers = { ...callBackendExtraFetchHeaders() };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  try {
+    const backendRes = await fetch(url, { headers });
+    if (!backendRes.ok) {
+      const text = await backendRes.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = {};
+      }
+      res.status(backendRes.status);
+      res.setHeader("Content-Type", "application/json");
+      return res.send(
+        JSON.stringify(
+          data?.error
+            ? data
+            : { error: data.message || text || "Recording request failed" },
+        ),
+      );
+    }
+    const contentType =
+      backendRes.headers.get("content-type") || "audio/mpeg";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    const buffer = Buffer.from(await backendRes.arrayBuffer());
+    return res.send(buffer);
+  } catch (err) {
+    console.error(
+      "[Call] GET /api/calls/:callId/recording error:",
+      err.message,
+    );
+    return res
       .status(502)
       .json({ error: "Call backend unavailable", detail: err.message });
   }

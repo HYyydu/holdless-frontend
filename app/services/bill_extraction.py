@@ -48,6 +48,54 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return {}
 
 
+_INSURANCE_DOCUMENT_TYPES = frozenset(
+    {"insurance", "insurance_card", "certificate_of_coverage", "insurance_document"}
+)
+
+
+def _normalize_insurance_fields(data: dict[str, Any]) -> dict[str, str]:
+    """Map model JSON to client insurance/member field names."""
+    raw: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
+    for snake, camel in (
+        ("document_type", "documentType"),
+        ("member_name", "memberName"),
+        ("member_id", "memberId"),
+        ("date_of_birth", "dateOfBirth"),
+        ("member_phone_number", "memberPhoneNumber"),
+        ("member_email", "memberEmail"),
+        ("member_address", "memberAddress"),
+        ("insurance_company_name", "insuranceCompanyName"),
+        ("insurance_phone_number", "insurancePhoneNumber"),
+    ):
+        if not _safe_str(raw.get(snake)) and _safe_str(raw.get(camel)):
+            raw[snake] = raw[camel]
+
+    out: dict[str, str] = {}
+    doc_type = (_safe_str(raw.get("document_type")) or "").lower().replace("-", "_")
+    if doc_type in _INSURANCE_DOCUMENT_TYPES:
+        out["documentType"] = "insurance"
+    elif doc_type in ("medical_bill", "bill"):
+        out["documentType"] = "medical_bill"
+    elif doc_type:
+        out["documentType"] = doc_type
+
+    mapping = {
+        "member_name": "memberName",
+        "member_id": "memberId",
+        "date_of_birth": "dateOfBirth",
+        "member_phone_number": "memberPhoneNumber",
+        "member_email": "memberEmail",
+        "member_address": "memberAddress",
+        "insurance_company_name": "insuranceCompanyName",
+        "insurance_phone_number": "insurancePhoneNumber",
+    }
+    for src, dst in mapping.items():
+        val = _safe_str(raw.get(src))
+        if val:
+            out[dst] = val
+    return out
+
+
 def _normalize_bill_fields(data: dict[str, Any]) -> dict[str, str]:
     """Map model JSON to client field names. Accepts snake_case (prompt) or camelCase drift."""
     raw: dict[str, Any] = dict(data) if isinstance(data, dict) else {}
@@ -109,19 +157,34 @@ def _signed_url_from_response(signed: Any) -> str | None:
     return _safe_str(signed.get("signedURL")) or _safe_str(signed.get("signedUrl"))
 
 
+def _merge_extraction_fields(*parts: dict[str, str]) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for part in parts:
+        for key, value in part.items():
+            if value and not merged.get(key):
+                merged[key] = value
+    return merged
+
+
 def _extract_from_image_url(image_url: str) -> dict[str, str]:
     client = get_openai_client()
     if not client:
         return {}
     prompt = (
-        "Extract bill facts from this image and return JSON only with these keys: "
-        "company_provider_name, bill_amount, invoice_number, account_number, bill_due_date, charge_or_service_date, billing_phone_number. "
-        "Put the value labeled Invoice / Invoice number / INV in invoice_number. "
-        "Put the value labeled Account / Account number / Patient account in account_number. "
-        "When both exist, they must differ—do not copy the account number into invoice_number. "
-        "For billing_phone_number, prefer the patient billing / customer service / Questions line "
-        "(not the main hospital switchboard) when both appear. "
-        "If a field is missing or unreadable, use empty string."
+        "Classify this document and extract facts. Return JSON only with these keys:\n"
+        "document_type: one of medical_bill, insurance_card, certificate_of_coverage, or unknown.\n"
+        "For medical bills: company_provider_name, bill_amount, invoice_number, account_number, "
+        "bill_due_date, charge_or_service_date, billing_phone_number.\n"
+        "For insurance cards / certificates of coverage: member_name (policyholder/member name), "
+        "member_id (member ID / subscriber ID), date_of_birth, member_phone_number (policyholder phone only), "
+        "member_email (policyholder email only), member_address (policyholder home/mailing address only), "
+        "insurance_company_name, insurance_phone_number (member services / eligibility / customer service).\n"
+        "Rules:\n"
+        "- Put Invoice / INV labels in invoice_number; Account / Patient account in account_number.\n"
+        "- Do not copy account number into invoice_number when both exist.\n"
+        "- For billing_phone_number prefer patient billing / customer service over hospital switchboard.\n"
+        "- For insurance docs, only fill member_phone_number/member_email/member_address if clearly the policyholder's.\n"
+        "- Use empty string for missing or unreadable fields."
     )
     try:
         completion = client.chat.completions.create(
@@ -135,7 +198,7 @@ def _extract_from_image_url(image_url: str) -> dict[str, str]:
                     ],
                 }
             ],
-            max_tokens=300,
+            max_tokens=400,
             response_format={"type": "json_object"},
             temperature=0,
         )
@@ -143,7 +206,18 @@ def _extract_from_image_url(image_url: str) -> dict[str, str]:
     except Exception as e:
         logger.warning("Bill image extraction failed: %s", e)
         return {}
-    return _normalize_bill_fields(_extract_json_object(content or ""))
+    parsed = _extract_json_object(content or "")
+    doc_type = (_safe_str(parsed.get("document_type")) or "").lower()
+    insurance_types = {"insurance_card", "certificate_of_coverage", "insurance", "insurance_document"}
+    if doc_type in insurance_types or doc_type.startswith("insurance"):
+        return _merge_extraction_fields(
+            _normalize_insurance_fields(parsed),
+            _normalize_bill_fields(parsed),
+        )
+    return _merge_extraction_fields(
+        _normalize_bill_fields(parsed),
+        _normalize_insurance_fields(parsed),
+    )
 
 
 def _extract_from_pdf_bytes(blob: bytes) -> dict[str, str]:
@@ -166,20 +240,20 @@ def _extract_from_pdf_bytes(blob: bytes) -> dict[str, str]:
     if not pdf_text:
         return {}
     prompt = (
-        "Extract bill facts from this text and return JSON only with these keys: "
-        "company_provider_name, bill_amount, invoice_number, account_number, bill_due_date, charge_or_service_date, billing_phone_number. "
-        "Put the value labeled Invoice / Invoice number / INV in invoice_number. "
-        "Put the value labeled Account / Account number in account_number. "
-        "When both exist, they must differ—do not copy the account number into invoice_number. "
-        "For billing_phone_number, prefer patient billing / customer service numbers over general facility lines. "
-        "If a field is missing or unreadable, use empty string.\n\n"
-        f"Bill text:\n{pdf_text}"
+        "Classify this document and extract facts. Return JSON only with these keys:\n"
+        "document_type: one of medical_bill, insurance_card, certificate_of_coverage, or unknown.\n"
+        "For medical bills: company_provider_name, bill_amount, invoice_number, account_number, "
+        "bill_due_date, charge_or_service_date, billing_phone_number.\n"
+        "For insurance cards / certificates of coverage: member_name, member_id, date_of_birth, "
+        "member_phone_number, member_email, member_address, insurance_company_name, insurance_phone_number.\n"
+        "Use empty string for missing fields.\n\n"
+        f"Document text:\n{pdf_text}"
     )
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_tokens=400,
             response_format={"type": "json_object"},
             temperature=0,
         )
@@ -187,7 +261,18 @@ def _extract_from_pdf_bytes(blob: bytes) -> dict[str, str]:
     except Exception as e:
         logger.warning("Bill PDF extraction failed: %s", e)
         return {}
-    return _normalize_bill_fields(_extract_json_object(content or ""))
+    parsed = _extract_json_object(content or "")
+    doc_type = (_safe_str(parsed.get("document_type")) or "").lower()
+    insurance_types = {"insurance_card", "certificate_of_coverage", "insurance", "insurance_document"}
+    if doc_type in insurance_types or doc_type.startswith("insurance"):
+        return _merge_extraction_fields(
+            _normalize_insurance_fields(parsed),
+            _normalize_bill_fields(parsed),
+        )
+    return _merge_extraction_fields(
+        _normalize_bill_fields(parsed),
+        _normalize_insurance_fields(parsed),
+    )
 
 
 def extract_bill_fields_from_attachments(attachments: list[dict[str, Any]]) -> dict[str, str]:

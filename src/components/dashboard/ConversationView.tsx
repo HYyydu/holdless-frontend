@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { ArrowLeft, Plus, Send, Star, Upload, Mic } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import {
@@ -15,6 +15,7 @@ import { callTrialRemainingFromChatResponse } from "@/lib/callTrialDisplay";
 import { useDemoAuth } from "@/contexts/DemoAuthContext";
 import { useCallBackendAuth } from "@/contexts/CallBackendAuthContext";
 import { useUserProfile } from "@/hooks/useUserProfile";
+import { hasCompleteMedicalInsurance } from "@/lib/medicalInsuranceProfile";
 import {
   TASK_ATTACHMENT_BUCKET,
   uploadTaskAttachments,
@@ -191,7 +192,9 @@ function yesNoButtonsForState(
   if (
     debug_state === "AWAITING_PET_CONFIRM" ||
     debug_state === "AWAITING_CALL_CONFIRM" ||
-    debug_state === "RETURN_AWAITING_PERSONAL_INFO_CONFIRM"
+    debug_state === "RETURN_AWAITING_CALL_CONFIRM" ||
+    debug_state === "RETURN_AWAITING_PERSONAL_INFO_CONFIRM" ||
+    debug_state === "RETURN_AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM"
   ) {
     return [
       { label: "Yes", primary: true },
@@ -288,23 +291,47 @@ export function ConversationView({
     profileFirstName: resolvedFirstName,
     userId: user?.id ?? undefined,
   };
-  const personalProfilePayload: ChatPersonalProfilePayload = {
-    firstName: resolvedFirstName,
-    lastName: resolvedLastName,
-    name: resolvedFullName,
-    email: profile?.email || undefined,
-    phone: profile?.phone || undefined,
-    address: profile?.address || undefined,
-    dateOfBirth: profile?.dateOfBirth || undefined,
-    state: profile?.state || undefined,
-    zipCode: profile?.zipCode || undefined,
-    tone: profile?.tone || undefined,
-    language: profile?.language || undefined,
-    timeZone:
-      (typeof Intl !== "undefined"
-        ? Intl.DateTimeFormat().resolvedOptions().timeZone
-        : undefined) || undefined,
-  };
+  const insuranceProfileReady =
+    isProfileLoaded && profile && hasCompleteMedicalInsurance(profile);
+
+  const personalProfilePayload: ChatPersonalProfilePayload = useMemo(
+    () => ({
+      firstName: resolvedFirstName,
+      lastName: resolvedLastName,
+      name: resolvedFullName,
+      email: profile?.email || undefined,
+      phone: profile?.phone || undefined,
+      address: profile?.address || undefined,
+      dateOfBirth: profile?.dateOfBirth || undefined,
+      state: profile?.state || undefined,
+      zipCode: profile?.zipCode || undefined,
+      tone: profile?.tone || undefined,
+      language: profile?.language || undefined,
+      ...(insuranceProfileReady
+        ? {
+            insuranceMemberName: profile.insuranceMemberName,
+            insuranceDateOfBirth: profile.insuranceDateOfBirth,
+            insuranceMemberId: profile.insuranceMemberId,
+            insuranceCompanyName: profile.insuranceCompanyName,
+            insurancePhoneNumber: profile.insurancePhoneNumber,
+            insuranceEmail: profile.insuranceEmail,
+            insuranceAddress: profile.insuranceAddress,
+            insuranceCardImagePath: profile.insuranceCardImagePath,
+          }
+        : {}),
+      timeZone:
+        (typeof Intl !== "undefined"
+          ? Intl.DateTimeFormat().resolvedOptions().timeZone
+          : undefined) || undefined,
+    }),
+    [
+      resolvedFirstName,
+      resolvedLastName,
+      resolvedFullName,
+      profile,
+      insuranceProfileReady,
+    ],
+  );
 
   const initialMsgs: Message[] = initialMessages?.length
     ? initialMessages.map((m, i) => ({
@@ -356,6 +383,7 @@ export function ConversationView({
       (/Should I proceed with the call/i.test(lastAssistant.content) ||
         /Please confirm before I place the call/i.test(lastAssistant.content) ||
         /Please confirm:/i.test(lastAssistant.content) ||
+        /Medical Insurance card/i.test(lastAssistant.content) ||
         /I'll call that number/i.test(lastAssistant.content));
     if (!awaiting) return null;
     const sid = restorePythonConversationIdFromSession();
@@ -369,6 +397,7 @@ export function ConversationView({
         m.role === "assistant" &&
         (/Should I proceed with the call/i.test(m.content) ||
           /Please confirm/i.test(m.content) ||
+          /Medical Insurance card/i.test(m.content) ||
           /I'll call that number/i.test(m.content) ||
           /\*\*Talking points\*\*/.test(m.content)),
     );
@@ -700,6 +729,7 @@ export function ConversationView({
     userId,
     callBackendToken,
     isProfileLoaded,
+    personalProfilePayload,
     handleApiResponse,
     onCallTaskCreated,
     onCallTaskStatusUpdate,

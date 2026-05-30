@@ -86,6 +86,9 @@ export interface CallStatus {
   output_tokens?: number;
   /** Set when the user was bridged in via conference join (POST /api/calls/:id/join). */
   user_joined_at?: string | null;
+  /** Twilio call recording URL when processing is complete. */
+  recording_url?: string | null;
+  has_recording?: boolean;
 }
 
 export interface GetCallStatusOptions {
@@ -193,6 +196,28 @@ export interface GetTranscriptsResponse {
  * Fetches full transcript records for a call (after call ends).
  * GET /api/calls/:callId/transcripts — ordered by timestamp.
  */
+/**
+ * Fetches call recording audio (MP3) via authenticated proxy. Returns null if not ready.
+ */
+export async function fetchCallRecording(
+  callId: string,
+  options?: GetCallStatusOptions,
+): Promise<Blob | null> {
+  const headers: Record<string, string> = {};
+  const token = options?.callBackendToken?.trim();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  try {
+    const res = await fetch(`/api/calls/${encodeURIComponent(callId)}/recording`, {
+      headers,
+    });
+    if (!res.ok) return null;
+    return await res.blob();
+  } catch (e) {
+    console.warn("fetchCallRecording failed", e);
+    return null;
+  }
+}
+
 export async function getTranscripts(
   callId: string,
   options?: GetCallStatusOptions,
@@ -762,6 +787,8 @@ export interface TaskRowFromApi {
 }
 
 export interface ExtractedBillFields {
+  /** medical_bill | insurance | unknown */
+  documentType?: string;
   companyProviderName?: string;
   billAmount?: string;
   /** Labeled invoice / INV on the document */
@@ -773,6 +800,15 @@ export interface ExtractedBillFields {
   billDueDate?: string;
   chargeOrServiceDate?: string;
   billingPhoneNumber?: string;
+  /** Insurance card / certificate of coverage fields */
+  memberName?: string;
+  memberId?: string;
+  dateOfBirth?: string;
+  memberPhoneNumber?: string;
+  memberEmail?: string;
+  memberAddress?: string;
+  insuranceCompanyName?: string;
+  insurancePhoneNumber?: string;
 }
 
 export interface ChatAttachmentPayload {
@@ -797,6 +833,15 @@ export interface ChatPersonalProfilePayload {
   tone?: string;
   language?: string;
   timeZone?: string;
+  insuranceMemberName?: string;
+  insuranceDateOfBirth?: string;
+  insuranceMemberId?: string;
+  insuranceCompanyName?: string;
+  insurancePhoneNumber?: string;
+  insuranceEmail?: string;
+  insuranceAddress?: string;
+  /** Supabase storage path — required for backend to treat profile as complete */
+  insuranceCardImagePath?: string;
 }
 
 /**

@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
-import { ArrowLeft, Phone, FileText, CheckCircle, Clock, RefreshCw, MessageSquare, AlertCircle } from 'lucide-react';
+import { ArrowLeft, Phone, FileText, CheckCircle, Clock, RefreshCw, MessageSquare, AlertCircle, Headphones, Loader2 } from 'lucide-react';
 import {
   CALL_STATUS_SESSION_GRACE_MS,
+  fetchCallRecording,
   getCallStatusWithMeta,
   isCallEndedStatus,
 } from '@/lib/chatApi';
@@ -91,6 +92,126 @@ function SummarySection({
         )}
       </div>
     </div>
+  );
+}
+
+function CallRecordingSection({
+  callId,
+  isOngoing,
+  callBackendToken,
+}: {
+  callId: string;
+  isOngoing: boolean;
+  callBackendToken?: string | null;
+}) {
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
+  const pollAttemptsRef = useRef(0);
+  const loadedRef = useRef(false);
+
+  useEffect(() => {
+    if (isOngoing || !callId) {
+      setAudioUrl(null);
+      setUnavailable(false);
+      setLoading(false);
+      pollAttemptsRef.current = 0;
+      loadedRef.current = false;
+      return;
+    }
+
+    let cancelled = false;
+    const opts = { callBackendToken: callBackendToken ?? undefined };
+
+    const tryLoad = async () => {
+      if (cancelled || loadedRef.current) return;
+      setLoading(true);
+
+      // Try streaming first — backend syncs from Twilio even if status proxy omits recording_url.
+      const blob = await fetchCallRecording(callId, opts);
+      if (cancelled) return;
+      if (blob && blob.size > 0) {
+        loadedRef.current = true;
+        setAudioUrl((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return URL.createObjectURL(blob);
+        });
+        setUnavailable(false);
+        setLoading(false);
+        return;
+      }
+
+      const meta = await getCallStatusWithMeta(callId, opts);
+      if (cancelled) return;
+      const hasRecording =
+        meta.ok &&
+        Boolean(meta.data.recording_url ?? meta.data.has_recording);
+
+      pollAttemptsRef.current += 1;
+      if (!hasRecording && pollAttemptsRef.current >= 15) {
+        setUnavailable(true);
+      }
+      setLoading(false);
+    };
+
+    void tryLoad();
+    const intervalId = setInterval(() => void tryLoad(), 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [callId, isOngoing, callBackendToken]);
+
+  useEffect(() => {
+    return () => {
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+    };
+  }, [audioUrl]);
+
+  if (isOngoing) {
+    return (
+      <p className="text-sm text-gray-500">
+        Call recording will be available after the call ends.
+      </p>
+    );
+  }
+
+  if (audioUrl) {
+    return (
+      <audio
+        controls
+        preload="metadata"
+        className="w-full max-w-md"
+        src={audioUrl}
+      >
+        Your browser does not support audio playback.
+      </audio>
+    );
+  }
+
+  if (loading && !unavailable) {
+    return (
+      <p className="inline-flex items-center gap-2 text-sm text-gray-500">
+        <Loader2 className="w-4 h-4 animate-spin" />
+        Processing call recording…
+      </p>
+    );
+  }
+
+  if (unavailable) {
+    return (
+      <p className="text-sm text-gray-500">
+        No recording is available for this call.
+      </p>
+    );
+  }
+
+  return (
+    <p className="inline-flex items-center gap-2 text-sm text-gray-500">
+      <Loader2 className="w-4 h-4 animate-spin" />
+      Waiting for recording…
+    </p>
   );
 }
 
@@ -304,6 +425,18 @@ export function CallTaskDetailsView({ task, onBack, onWatchTranscript, onCallEnd
                 Transcript record
               </button>
             </div>
+          </div>
+
+          <div className="bg-white border border-gray-200 rounded-xl p-6 shadow-sm">
+            <div className="flex items-center gap-2 mb-5">
+              <Headphones className="w-5 h-5 text-gray-600" />
+              <h2 className="text-lg font-semibold text-gray-900">Listen to record</h2>
+            </div>
+            <CallRecordingSection
+              callId={task.callId}
+              isOngoing={isOngoing}
+              callBackendToken={callBackendToken}
+            />
           </div>
 
           {/* 3. AI call summary (with respect to purpose) */}

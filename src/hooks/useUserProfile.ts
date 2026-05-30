@@ -1,4 +1,10 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+  getMissingMedicalInsuranceFields,
+  getMissingMedicalInsuranceLabels,
+  hasCompleteMedicalInsurance,
+  hasPartialMedicalInsurance,
+} from '@/lib/medicalInsuranceProfile';
 
 export interface UserProfile {
   firstName: string;
@@ -11,6 +17,20 @@ export interface UserProfile {
   zipCode: string;
   tone: string;
   language: string;
+  /** Name as shown on insurance card / certificate */
+  insuranceMemberName: string;
+  insuranceDateOfBirth: string;
+  insuranceMemberId: string;
+  /** Insurer / plan administrator (e.g. Aetna, WellAway) */
+  insuranceCompanyName: string;
+  /** Member services / eligibility phone on the card */
+  insurancePhoneNumber: string;
+  /** Email on insurance account / card */
+  insuranceEmail: string;
+  /** Mailing address on insurance account / card */
+  insuranceAddress: string;
+  /** Supabase storage path for uploaded card image */
+  insuranceCardImagePath: string;
 }
 
 const STORAGE_KEY = 'holdless_user_profile';
@@ -26,6 +46,14 @@ const defaultProfile: UserProfile = {
   zipCode: '',
   tone: '',
   language: '',
+  insuranceMemberName: '',
+  insuranceDateOfBirth: '',
+  insuranceMemberId: '',
+  insuranceCompanyName: '',
+  insurancePhoneNumber: '',
+  insuranceEmail: '',
+  insuranceAddress: '',
+  insuranceCardImagePath: '',
 };
 
 export function useUserProfile() {
@@ -85,11 +113,35 @@ export function useUserProfile() {
     profile.zipCode?.trim()
   );
 
+  const hasCompleteInsurance = useMemo(
+    () => hasCompleteMedicalInsurance(profile),
+    [profile],
+  );
+
+  const hasPartialInsurance = useMemo(
+    () => hasPartialMedicalInsurance(profile),
+    [profile],
+  );
+
+  const missingInsuranceFields = useMemo(
+    () => getMissingMedicalInsuranceFields(profile),
+    [profile],
+  );
+
+  const missingInsuranceLabels = useMemo(
+    () => getMissingMedicalInsuranceLabels(profile),
+    [profile],
+  );
+
   return {
     profile,
     isLoaded,
     updateProfile,
     updateMultipleFields,
     hasEssentialInfo,
+    hasCompleteInsurance,
+    hasPartialInsurance,
+    missingInsuranceFields,
+    missingInsuranceLabels,
   };
 }

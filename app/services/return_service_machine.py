@@ -46,11 +46,40 @@ class ReturnFlowState(str, Enum):
     AWAITING_PHONE_OR_ZIP = "RETURN_AWAITING_PHONE_OR_ZIP"
     AWAITING_REASON = "RETURN_AWAITING_REASON"  # general_business_quote only: ask what kind of service
     AWAITING_PERSONAL_INFO_CONFIRM = "RETURN_AWAITING_PERSONAL_INFO_CONFIRM"
+    AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM = "RETURN_AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM"
     AWAITING_INSURANCE_DETAILS = "RETURN_AWAITING_INSURANCE_DETAILS"
     AWAITING_CALL_CONFIRM = "RETURN_AWAITING_CALL_CONFIRM"
     CONFIRMED = "RETURN_CONFIRMED"
 
 INSURANCE_FLOW_TAG = "insurance_search"
+INSURANCE_PRECALL_MODE_QUOTE = "quote"
+INSURANCE_PRECALL_MODE_MEMBER = "member"
+
+INSURANCE_MEMBER_SLOT_ORDER: list[str] = [
+    "name",
+    "date_of_birth",
+    "phone",
+    "email",
+    "member_id",
+    "address",
+]
+INSURANCE_MEMBER_SLOT_PROMPTS: dict[str, str] = {
+    "name": "What is your full name (as it appears on your insurance)?",
+    "date_of_birth": "What is your date of birth? (mm/dd/yyyy)",
+    "phone": "What phone number should I use if they ask to verify your account?",
+    "email": "What email address is on your insurance account?",
+    "member_id": "What is your member ID / subscriber ID?",
+    "address": "What is your mailing address on file with the insurer?",
+}
+INSURANCE_MEMBER_SLOT_LABELS: dict[str, str] = {
+    "name": "Name",
+    "date_of_birth": "Date of birth",
+    "phone": "Phone number",
+    "email": "Email",
+    "member_id": "Member ID",
+    "address": "Address",
+}
+
 INSURANCE_SLOT_ORDER: list[str] = [
     "zip_code",
     "age",
@@ -112,6 +141,203 @@ def _is_insurance_quote_intent(text: str) -> bool:
     return any(sig in low for sig in quote_signals)
 
 
+def _insurance_precall_mode(context: dict[str, Any]) -> str:
+    mode = str(context.get("insurance_precall_mode") or "").strip().lower()
+    if mode == INSURANCE_PRECALL_MODE_MEMBER:
+        return INSURANCE_PRECALL_MODE_MEMBER
+    return INSURANCE_PRECALL_MODE_QUOTE
+
+
+def _active_insurance_slot_order(context: dict[str, Any]) -> list[str]:
+    if _insurance_precall_mode(context) == INSURANCE_PRECALL_MODE_MEMBER:
+        return INSURANCE_MEMBER_SLOT_ORDER
+    return INSURANCE_SLOT_ORDER
+
+
+def _insurance_member_prefill_from_extraction(context: dict[str, Any]) -> dict[str, str]:
+    raw = context.get("insurance_member_extracted")
+    if not isinstance(raw, dict):
+        return {}
+    mapping = {
+        "memberName": "name",
+        "dateOfBirth": "date_of_birth",
+        "memberPhoneNumber": "phone",
+        "memberEmail": "email",
+        "memberId": "member_id",
+        "memberAddress": "address",
+    }
+    prefill: dict[str, str] = {}
+    for src, slot in mapping.items():
+        value = str(raw.get(src) or "").strip()
+        if value:
+            prefill[slot] = value
+    return prefill
+
+
+_MEDICAL_INSURANCE_REQUIRED_KEYS = (
+    "insuranceMemberName",
+    "insuranceDateOfBirth",
+    "insuranceMemberId",
+    "insuranceCompanyName",
+    "insurancePhoneNumber",
+    "insuranceEmail",
+    "insuranceAddress",
+    "insuranceCardImagePath",
+)
+
+
+def _has_complete_medical_insurance_profile(profile: dict[str, str]) -> bool:
+    return all(str(profile.get(key) or "").strip() for key in _MEDICAL_INSURANCE_REQUIRED_KEYS)
+
+
+def _insurance_member_prefill_from_personal_profile(
+    context: dict[str, Any],
+    *,
+    missing_slots: list[str] | None = None,
+) -> dict[str, str]:
+    profile = _saved_personal_profile(context)
+    if not profile:
+        return {}
+    prefill: dict[str, str] = {}
+    insurance_complete = _has_complete_medical_insurance_profile(profile)
+    if insurance_complete:
+        name = (profile.get("insuranceMemberName") or profile.get("name") or "").strip()
+        dob = (
+            profile.get("insuranceDateOfBirth") or profile.get("dateOfBirth") or ""
+        ).strip()
+        member_id = (profile.get("insuranceMemberId") or "").strip()
+    else:
+        name = (profile.get("name") or "").strip()
+        dob = (profile.get("dateOfBirth") or "").strip()
+        member_id = ""
+    if not name:
+        first = str(context.get("personal_profile", {}).get("firstName") or "").strip()
+        last = str(context.get("personal_profile", {}).get("lastName") or "").strip()
+        name = f"{first} {last}".strip()
+    if name and (not missing_slots or "name" in missing_slots):
+        prefill["name"] = name
+    if dob and (not missing_slots or "date_of_birth" in missing_slots):
+        prefill["date_of_birth"] = dob
+    if member_id and (not missing_slots or "member_id" in missing_slots):
+        prefill["member_id"] = member_id
+    phone = (profile.get("phone") or "").strip()
+    if phone and (not missing_slots or "phone" in missing_slots):
+        prefill["phone"] = phone
+    if insurance_complete:
+        email = (profile.get("insuranceEmail") or profile.get("email") or "").strip()
+        address = (profile.get("insuranceAddress") or profile.get("address") or "").strip()
+    else:
+        email = (profile.get("email") or "").strip()
+        address = (profile.get("address") or "").strip()
+    if email and (not missing_slots or "email" in missing_slots):
+        prefill["email"] = email
+    if address and (not missing_slots or "address" in missing_slots):
+        if insurance_complete or not (profile.get("state") or profile.get("zipCode")):
+            prefill["address"] = address
+        else:
+            state = (profile.get("state") or "").strip()
+            zip_code = (profile.get("zipCode") or "").strip()
+            parts = [address]
+            if state:
+                parts.append(state)
+            if zip_code:
+                parts.append(zip_code)
+            prefill["address"] = ", ".join(parts)
+    return prefill
+
+
+def _insurance_member_slot_label(slot: str) -> str:
+    return INSURANCE_MEMBER_SLOT_LABELS.get(slot, slot.replace("_", " "))
+
+
+def _next_insurance_member_slot(context: dict[str, Any]) -> str | None:
+    profile = _insurance_profile(context)
+    for slot in INSURANCE_MEMBER_SLOT_ORDER:
+        if not str(profile.get(slot) or "").strip():
+            return slot
+    return None
+
+
+def _needs_insurance_member_details(context: dict[str, Any]) -> bool:
+    return context.get("insurance_member_precall_required") is True
+
+
+def _format_insurance_member_details(context: dict[str, Any]) -> str:
+    profile = _insurance_profile(context)
+    if not profile:
+        return ""
+    lines = []
+    for key, label in INSURANCE_MEMBER_SLOT_LABELS.items():
+        value = str(profile.get(key) or "").strip()
+        if value:
+            lines.append(f"{label}: {value}")
+    return "\n".join(lines)
+
+
+def _advance_insurance_member_collection(
+    context: dict[str, Any],
+    *,
+    preface: str | None = None,
+) -> tuple[ReturnFlowState, dict[str, Any], str, dict[str, Any] | None]:
+    profile = _insurance_profile(context)
+    extracted = _insurance_member_prefill_from_extraction(context)
+    for slot, value in extracted.items():
+        if value and not str(profile.get(slot) or "").strip():
+            profile[slot] = value
+    context["insurance_call_profile"] = profile
+
+    slot = _next_insurance_member_slot(context)
+    if not slot:
+        context["insurance_call_profile"] = profile
+        context["call_details"] = _format_insurance_member_details(context)
+        summary = _build_return_summary(context)
+        return (
+            ReturnFlowState.AWAITING_CALL_CONFIRM,
+            context,
+            "Thanks — I have your insurance member details. Please confirm:\n\n" + summary,
+            None,
+        )
+
+    prefill_decided = bool(context.get("insurance_profile_prefill_decided"))
+    if not prefill_decided:
+        missing = [s for s in INSURANCE_MEMBER_SLOT_ORDER if not str(profile.get(s) or "").strip()]
+        prefill = _insurance_member_prefill_from_personal_profile(context, missing_slots=missing)
+        if prefill:
+            context["insurance_profile_prefill_candidate"] = prefill
+            context["insurance_profile_prefill_decided"] = False
+            lines = [
+                "I found some details on your insurance card, but I still need a few items before calling.",
+                "",
+                "Can I use your saved Personal Information for the missing details?",
+                "",
+            ]
+            for s in INSURANCE_MEMBER_SLOT_ORDER:
+                value = str(prefill.get(s) or "").strip()
+                if value:
+                    lines.append(f"• {_insurance_member_slot_label(s)}: {value}")
+            lines.extend(["", "(yes/no)"])
+            prompt = "\n".join(lines)
+            if preface:
+                prompt = f"{preface}\n\n{prompt}"
+            return (
+                ReturnFlowState.AWAITING_PERSONAL_INFO_CONFIRM,
+                context,
+                prompt,
+                None,
+            )
+        context["insurance_profile_prefill_decided"] = True
+
+    prompt = INSURANCE_MEMBER_SLOT_PROMPTS.get(slot, f"Please provide {slot}.")
+    if preface:
+        prompt = f"{preface}\n\n{prompt}"
+    return (
+        ReturnFlowState.AWAITING_INSURANCE_DETAILS,
+        context,
+        prompt,
+        None,
+    )
+
+
 def _insurance_profile(context: dict[str, Any]) -> dict[str, str]:
     raw = context.get("insurance_call_profile")
     if isinstance(raw, dict):
@@ -132,6 +358,13 @@ def _saved_personal_profile(context: dict[str, Any]) -> dict[str, str]:
         "dateOfBirth",
         "state",
         "zipCode",
+        "insuranceMemberName",
+        "insuranceDateOfBirth",
+        "insuranceMemberId",
+        "insuranceCompanyName",
+        "insurancePhoneNumber",
+        "insuranceEmail",
+        "insuranceAddress",
         "householdSize",
         "annualIncome",
         "budgetRange",
@@ -217,13 +450,19 @@ def _insurance_prefill_from_personal_profile(context: dict[str, Any]) -> dict[st
     return prefill
 
 
-def _insurance_prefill_prompt(prefill: dict[str, str]) -> str:
+def _insurance_prefill_prompt(prefill: dict[str, str], context: dict[str, Any] | None = None) -> str:
+    slot_order = _active_insurance_slot_order(context or {})
+    label_fn = (
+        _insurance_member_slot_label
+        if slot_order is INSURANCE_MEMBER_SLOT_ORDER
+        else _insurance_slot_label
+    )
     lines = ["Can I use your saved Personal Information?", ""]
-    for slot in INSURANCE_SLOT_ORDER:
+    for slot in slot_order:
         value = str(prefill.get(slot) or "").strip()
         if not value:
             continue
-        lines.append(f"• {_insurance_slot_label(slot)}: {value}")
+        lines.append(f"• {label_fn(slot)}: {value}")
     lines.append("")
     lines.append("(yes/no)")
     return "\n".join(lines)
@@ -253,6 +492,8 @@ def _normalize_coverage_type(value: str) -> str:
 
 
 def _next_insurance_slot(context: dict[str, Any]) -> str | None:
+    if _insurance_precall_mode(context) == INSURANCE_PRECALL_MODE_MEMBER:
+        return _next_insurance_member_slot(context)
     profile = _insurance_profile(context)
     for slot in INSURANCE_SLOT_ORDER:
         if slot in INSURANCE_OPTIONAL_SLOTS:
@@ -271,6 +512,10 @@ def _advance_insurance_collection(
     *,
     preface: str | None = None,
 ) -> tuple[ReturnFlowState, dict[str, Any], str, dict[str, Any] | None]:
+    if _needs_insurance_member_details(context):
+        context["insurance_precall_mode"] = INSURANCE_PRECALL_MODE_MEMBER
+        return _advance_insurance_member_collection(context, preface=preface)
+    context["insurance_precall_mode"] = INSURANCE_PRECALL_MODE_QUOTE
     profile = _insurance_profile(context)
     slot = _next_insurance_slot(context)
     if not slot:
@@ -290,7 +535,7 @@ def _advance_insurance_collection(
         if prefill:
             context["insurance_profile_prefill_candidate"] = prefill
             context["insurance_profile_prefill_decided"] = False
-            prompt = _insurance_prefill_prompt(prefill)
+            prompt = _insurance_prefill_prompt(prefill, context)
             if preface:
                 prompt = f"{preface}\n\n{prompt}"
             return (
@@ -313,6 +558,8 @@ def _advance_insurance_collection(
 
 
 def _format_insurance_details(context: dict[str, Any]) -> str:
+    if _needs_insurance_member_details(context):
+        return _format_insurance_member_details(context)
     profile = _insurance_profile(context)
     if not profile:
         return ""
@@ -362,6 +609,12 @@ def _build_return_call_purpose(context: dict[str, Any]) -> str:
 
 def _build_return_summary(context: dict[str, Any]) -> str:
     """Summary for confirmation step (no pet, no clinics)."""
+    if context.get("medical_insurance_coverage_confirmed"):
+        from app.services.medical_insurance_coverage_analyzer import (
+            format_medical_insurance_coverage_confirmation,
+        )
+
+        return format_medical_insurance_coverage_confirmation(context)
     purpose = _build_return_call_purpose(context)
     context["call_reason"] = purpose
     parts = ["**Purpose**", purpose, ""]
@@ -374,10 +627,15 @@ def _build_return_summary(context: dict[str, Any]) -> str:
             for item in raw_items:
                 parts.append(f"• {item}")
             parts.append("")
-    if _needs_insurance_details(context):
+    if _needs_insurance_details(context) or _needs_insurance_member_details(context):
         insurance_details = _format_insurance_details(context)
         if insurance_details:
-            parts.append("Insurance pre-call profile:")
+            label = (
+                "Insurance member details:"
+                if _needs_insurance_member_details(context)
+                else "Insurance pre-call profile:"
+            )
+            parts.append(label)
             for ln in insurance_details.splitlines():
                 parts.append(f"• {ln}")
             parts.append("")
@@ -595,12 +853,19 @@ def transition(
                 context["phone"] = first_phone
                 context["call_reason"] = queue_payload["call_reason"]
                 context["call_details"] = ""
-                context["insurance_precall_required"] = queue_payload.get("flow_tag") == INSURANCE_FLOW_TAG
-                if context.get("insurance_precall_required"):
-                    return _advance_insurance_collection(
-                        context,
-                        preface="Before I call the insurance company, I need a few details.",
+                if not context.get("insurance_member_precall_required"):
+                    context["insurance_precall_required"] = (
+                        queue_payload.get("flow_tag") == INSURANCE_FLOW_TAG
                     )
+                if context.get("insurance_member_precall_required") or context.get(
+                    "insurance_precall_required"
+                ):
+                    preface = (
+                        "Before I call the insurance company, I need a few member details for verification."
+                        if context.get("insurance_member_precall_required")
+                        else "Before I call the insurance company, I need a few details."
+                    )
+                    return _advance_insurance_collection(context, preface=preface)
                 summary = _build_return_summary(context)
                 return (
                     ReturnFlowState.AWAITING_CALL_CONFIRM,
@@ -639,6 +904,11 @@ def transition(
                     context,
                     "Thanks, I have the number. What would you like me to ask them or what message should I deliver? (e.g. 'ask when they're available' or 'tell them we're going out tonight')",
                     None,
+                )
+            if is_general_call and _needs_insurance_member_details(context):
+                return _advance_insurance_collection(
+                    context,
+                    preface="Before I call the insurance company, I need a few member details for verification.",
                 )
             if is_general_call and _needs_insurance_details(context):
                 context["insurance_precall_required"] = True
@@ -706,12 +976,48 @@ def transition(
             None,
         )
 
+    if state == ReturnFlowState.AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM:
+        if _is_yes(msg):
+            from app.services.medical_insurance_coverage_analyzer import (
+                apply_medical_insurance_profile_to_call_context,
+                format_medical_insurance_coverage_confirmation,
+            )
+
+            context["flow_type"] = FLOW_GENERAL_CALL
+            context = apply_medical_insurance_profile_to_call_context(context)
+            context["medical_insurance_coverage_confirmed"] = True
+            summary = format_medical_insurance_coverage_confirmation(context)
+            return (
+                ReturnFlowState.AWAITING_CALL_CONFIRM,
+                context,
+                summary,
+                None,
+            )
+        if _is_no(msg):
+            context.pop("medical_insurance_coverage_flow", None)
+            context.pop("medical_coverage_bill_fields", None)
+            context.pop("medical_coverage_user_message", None)
+            return (
+                ReturnFlowState.AWAITING_PHONE_OR_ZIP,
+                context,
+                "No problem. Please send your insurance company's phone number (10 digits), "
+                "or share a ZIP code if you'd like me to search for member services numbers.",
+                None,
+            )
+        return (
+            state,
+            context,
+            "Please answer yes or no: should I use your saved Medical Insurance card for this call?",
+            None,
+        )
+
     if state == ReturnFlowState.AWAITING_PERSONAL_INFO_CONFIRM:
+        slot_order = _active_insurance_slot_order(context)
         if _is_yes(msg):
             profile = _insurance_profile(context)
             candidate = context.get("insurance_profile_prefill_candidate")
             if isinstance(candidate, dict):
-                for slot in INSURANCE_SLOT_ORDER:
+                for slot in slot_order:
                     value = str(candidate.get(slot) or "").strip()
                     if value:
                         profile[slot] = value
@@ -736,11 +1042,16 @@ def transition(
         if not slot:
             return _advance_insurance_collection(context)
         raw = (msg or "").strip()
+        slot_prompts = (
+            INSURANCE_MEMBER_SLOT_PROMPTS
+            if _insurance_precall_mode(context) == INSURANCE_PRECALL_MODE_MEMBER
+            else INSURANCE_SLOT_PROMPTS
+        )
         if not raw:
             return (
                 state,
                 context,
-                INSURANCE_SLOT_PROMPTS.get(slot, f"Please provide {slot}."),
+                slot_prompts.get(slot, f"Please provide {slot}."),
                 None,
             )
         if slot in INSURANCE_OPTIONAL_SLOTS and raw.lower() in ("skip", "none", "n/a", "na", "no"):

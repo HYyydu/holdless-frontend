@@ -46,6 +46,9 @@ from app.services.slot_engine import (
     process as slot_engine_process,
 )
 from app.core.slot_registry.registry import SlotRegistry
+from app.services.medical_insurance_coverage_analyzer import (
+    analyze_medical_insurance_coverage_use,
+)
 from app.services.return_service_machine import (
     ReturnFlowState,
     is_return_flow_state,
@@ -163,6 +166,13 @@ _BILL_COST_OR_NEGOTIATION_RE = re.compile(
     r"\b(?:minimi[sz]e|reduce|lowering?|lower)\s+(?:the\s+)?(?:cost|amount|charges?|balance|bill)\b|"
     r"\b(?:waive|negotiate|settle|discount|adjustment|pay\s+less|too\s+high|overcharged)\b|"
     r"\b(?:get\s+(?:a\s+)?(?:better|lower)\s+(?:rate|price)|work\s+out\s+(?:a\s+)?payment)\b",
+    re.IGNORECASE,
+)
+_INSURANCE_CONTACT_RE = re.compile(
+    r"\b(?:call|contact|reach|speak\s+with|phone)\b.{0,100}"
+    r"\b(?:insurance|insurer|member\s+services|health\s+plan|health\s+insurance)\b|"
+    r"\b(?:insurance\s+company|my\s+insurance|insurance\s+card|certificate\s+of\s+coverage)\b|"
+    r"\b(?:verify\s+coverage|check\s+coverage|eligibility)\b",
     re.IGNORECASE,
 )
 _CAL_BOOKING_INTENT_RE = re.compile(
@@ -618,6 +628,7 @@ def _summarize_attachment_fields(fields: dict) -> str:
         return ""
     parts: list[str] = []
     for key, label in (
+        ("documentType", "document type"),
         ("companyProviderName", "provider"),
         ("billAmount", "bill amount"),
         ("invoiceNumber", "invoice"),
@@ -626,6 +637,14 @@ def _summarize_attachment_fields(fields: dict) -> str:
         ("billDueDate", "due date"),
         ("chargeOrServiceDate", "service date"),
         ("billingPhoneNumber", "billing phone"),
+        ("memberName", "member name"),
+        ("memberId", "member ID"),
+        ("dateOfBirth", "date of birth"),
+        ("memberPhoneNumber", "member phone"),
+        ("memberEmail", "member email"),
+        ("memberAddress", "member address"),
+        ("insuranceCompanyName", "insurance company"),
+        ("insurancePhoneNumber", "insurance phone"),
     ):
         value = str(fields.get(key) or "").strip()
         if not value:
@@ -664,6 +683,63 @@ def _merge_extracted_bill_fields_from_attachments(attachments: list[dict] | None
             if v and not merged.get(k):
                 merged[k] = v
     return merged
+
+
+def _merge_extracted_insurance_member_fields(attachments: list[dict] | None) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    if not isinstance(attachments, list):
+        return merged
+    keys = (
+        "documentType",
+        "memberName",
+        "memberId",
+        "dateOfBirth",
+        "memberPhoneNumber",
+        "memberEmail",
+        "memberAddress",
+        "insuranceCompanyName",
+        "insurancePhoneNumber",
+    )
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        ex = item.get("extractedFields")
+        if not isinstance(ex, dict):
+            continue
+        for k in keys:
+            v = str(ex.get(k) or "").strip()
+            if v and not merged.get(k):
+                merged[k] = v
+    return merged
+
+
+def _attachments_have_insurance_document(attachments: list[dict] | None) -> bool:
+    merged = _merge_extracted_insurance_member_fields(attachments)
+    doc_type = (merged.get("documentType") or "").strip().lower()
+    if doc_type == "insurance":
+        return True
+    return bool(merged.get("memberId") or merged.get("memberName"))
+
+
+def _apply_insurance_member_precall_context(context: dict, attachments: list[dict] | None) -> dict:
+    if not _attachments_have_insurance_document(attachments):
+        return context
+    extracted = _merge_extracted_insurance_member_fields(attachments)
+    context["insurance_member_extracted"] = extracted
+    context["insurance_member_precall_required"] = True
+    context["insurance_precall_required"] = False
+    context["insurance_profile_prefill_decided"] = False
+    context.pop("insurance_profile_prefill_candidate", None)
+    phone = str(extracted.get("insurancePhoneNumber") or "").strip()
+    if phone and not context.get("phone"):
+        normalized = _normalize_phone(phone)
+        if normalized:
+            context["phone"] = normalized
+            context["hospital_phone"] = normalized
+    company = str(extracted.get("insuranceCompanyName") or "").strip()
+    if company and not str(context.get("call_reason") or "").strip():
+        context["call_reason"] = f"Contact {company} about coverage"
+    return context
 
 
 def _bill_dispute_prefill_from_fields(
@@ -731,6 +807,10 @@ def _build_attachment_context(attachments: list[dict] | None) -> tuple[str, str 
             candidate = str(extracted.get("billingPhoneNumber") or "").strip()
             if candidate:
                 billing_phone = candidate
+            elif billing_phone is None:
+                insurance_phone = str(extracted.get("insurancePhoneNumber") or "").strip()
+                if insurance_phone:
+                    billing_phone = insurance_phone
     return ("\n".join(lines) if len(lines) > 1 else ""), billing_phone
 
 
@@ -760,9 +840,16 @@ def _context_for_redis(context: dict) -> dict:
         "clinic_candidates": context.get("clinic_candidates") or [],
         "selected_clinics": context.get("selected_clinics") or [],
         "insurance_precall_required": context.get("insurance_precall_required"),
+        "insurance_member_precall_required": context.get("insurance_member_precall_required"),
+        "insurance_member_extracted": context.get("insurance_member_extracted") or {},
+        "insurance_precall_mode": context.get("insurance_precall_mode"),
         "insurance_call_profile": context.get("insurance_call_profile") or {},
         "insurance_profile_prefill_candidate": context.get("insurance_profile_prefill_candidate") or {},
         "insurance_profile_prefill_decided": context.get("insurance_profile_prefill_decided"),
+        "medical_insurance_coverage_flow": context.get("medical_insurance_coverage_flow"),
+        "medical_coverage_bill_fields": context.get("medical_coverage_bill_fields") or {},
+        "medical_coverage_user_message": context.get("medical_coverage_user_message"),
+        "medical_insurance_coverage_confirmed": context.get("medical_insurance_coverage_confirmed"),
         "personal_profile": context.get("personal_profile") or {},
         "reply_locale": context.get("reply_locale"),
         "booking_timezone": context.get("booking_timezone"),
@@ -853,6 +940,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
         context["personal_profile"] = {
             k: v for k, v in personal_profile.items() if isinstance(v, (str, int, float, bool))
         }
+    context = _apply_insurance_member_precall_context(context, body.attachments)
 
     conversation_history: list[dict[str, str]] = []
     if conversation_id:
@@ -880,6 +968,73 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
     # Deterministic hybrid: if we previously showed "Would you like me to call?" and user confirms,
     # start the slot engine directly without re-running Layer 1 (avoids Layer 1 re-classifying "yes" as chat).
     new_state, updated_context, reply_text, ui_options = None, None, None, None
+
+    # Medical bill + ask insurer to cover: offer saved Medical Insurance card from profile.
+    _coverage_analysis = analyze_medical_insurance_coverage_use(
+        raw_message,
+        attachments=body.attachments,
+        personal_profile=personal_profile,
+    )
+    if new_state is None and at_entry_no_flow and _coverage_analysis.get("use_profile"):
+        context["flow_type"] = FLOW_GENERAL_CALL
+        context["medical_insurance_coverage_flow"] = True
+        context["medical_coverage_bill_fields"] = _coverage_analysis.get("bill_fields") or {}
+        context["medical_coverage_user_message"] = raw_message.strip()
+        new_state = ReturnFlowState.AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM
+        updated_context = context
+        reply_text = "Sure. I got your Medical Insurance card. Should we use that?"
+        ui_options = None
+    elif (
+        new_state is None
+        and at_entry_no_flow
+        and _coverage_analysis.get("coverage_ask")
+        and _coverage_analysis.get("bill_signal")
+        and not _coverage_analysis.get("profile_complete")
+    ):
+        new_state, updated_context, reply_text, ui_options = (
+            state,
+            context,
+            "I can call your insurance company about this bill. Please complete your Medical Insurance "
+            "profile in the Profile tab first (insurance card image, member ID, and institution phone number).",
+            None,
+        )
+
+    # Insurance card / certificate upload + contact insurer — collect member verification details.
+    _insurance_member_fast_path = (
+        at_entry_no_flow
+        and context.get("insurance_member_precall_required")
+        and (
+            _INSURANCE_CONTACT_RE.search(raw_message or "")
+            or extracted_billing_phone
+            or _normalize_phone(raw_message or "")
+            or context.get("phone")
+        )
+    )
+    if new_state is None and _insurance_member_fast_path:
+        context["flow_type"] = FLOW_GENERAL_CALL
+        merged_insurance = _merge_extracted_insurance_member_fields(body.attachments)
+        company = str(merged_insurance.get("insuranceCompanyName") or "").strip()
+        phone = (
+            context.get("phone")
+            or _normalize_phone(raw_message or "")
+            or _normalize_phone(str(merged_insurance.get("insurancePhoneNumber") or ""))
+        )
+        if phone:
+            context["phone"] = phone
+            context["hospital_phone"] = phone
+        if company and not str(context.get("call_reason") or "").strip():
+            context["call_reason"] = f"Contact {company} about coverage"
+        elif not str(context.get("call_reason") or "").strip():
+            context["call_reason"] = "Contact insurance company about coverage"
+        combined_message = raw_message.strip()
+        if phone and not _normalize_phone(raw_message or ""):
+            combined_message = f"Please call {phone}. {combined_message}".strip()
+        new_state, updated_context, reply_text, ui_options = return_transition(
+            ReturnFlowState.AWAITING_PHONE_OR_ZIP,
+            combined_message,
+            context,
+            conversation_history or None,
+        )
 
     # Bill dispute / cost negotiation + billing phone from OCR — MUST run before direct-call:
     # attachment context includes the substring "billing phone:" which used to match \bphone\b
@@ -974,9 +1129,10 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
             context["call_reason"] = queue_payload["call_reason"]
             context["flow_type"] = FLOW_GENERAL_CALL
             if queue_payload.get("flow_tag"):
-                context["insurance_precall_required"] = (
-                    queue_payload.get("flow_tag") == "insurance_search"
-                )
+                if not context.get("insurance_member_precall_required"):
+                    context["insurance_precall_required"] = (
+                        queue_payload.get("flow_tag") == "insurance_search"
+                    )
             return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
             new_state, updated_context, reply_text, ui_options = return_transition(
                 return_state, message, context, conversation_history or None
@@ -1146,6 +1302,7 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 # the confirm flow so the state machine (and optional LLM merge) can update context.
                 _stay_in_call_confirm = in_flow and current_state_str in (
                     ReturnFlowState.AWAITING_CALL_CONFIRM.value,
+                    ReturnFlowState.AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM.value,
                     ConversationState.AWAITING_CALL_CONFIRM.value,
                 )
                 if not _stay_in_call_confirm:

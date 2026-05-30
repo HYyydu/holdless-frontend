@@ -102,7 +102,7 @@ const Dashboard = () => {
   const [searchQuery, setSearchQuery] = useState('');
 
   // Use global user profile hook with persistence
-  const { profile, updateProfile } = useUserProfile();
+  const { profile, updateProfile, updateMultipleFields } = useUserProfile();
   const { user } = useDemoAuth();
   const userId = user?.id ?? null;
   const { pets, addPet, addError } = usePets(userId);
@@ -538,6 +538,8 @@ const Dashboard = () => {
                 <ProfileSection 
                   profile={profile}
                   onUpdateProfile={handleUpdateProfile}
+                  onUpdateMultipleFields={updateMultipleFields}
+                  userId={userId}
                 />
                 <PetProfilesSection pets={pets} onAddPet={addPet} addError={addError} />
               </div>
