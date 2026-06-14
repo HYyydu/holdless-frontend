@@ -22,6 +22,10 @@ import {
   validateTaskAttachment,
 } from "@/lib/taskAttachments";
 import { supabase } from "@/integrations/supabase/client";
+import {
+  resolveChatBackend,
+  type ChatBackend,
+} from "@/lib/chatBackendRouting";
 interface Message {
   id: string;
   role: "user" | "assistant" | "thinking";
@@ -222,7 +226,11 @@ function actionButtonsForReply(
   );
 }
 
-// Star rating component
+import {
+  conversationInCallPlacementFlow,
+  isAffirmativeReply,
+  userConfirmingPendingCall,
+} from "./callPlacementFlow.js";
 const StarRating = ({ rating }: { rating: number }) => (
   <div className="flex gap-0.5">
     {[1, 2, 3, 4, 5].map((star) => (
@@ -281,6 +289,38 @@ export function ConversationView({
   const conversationIdRef = useRef<string | null>(
     initialConversationId ?? null,
   );
+  const chatBackendStorageKey = `holdless_chat_backend:${userId}`;
+  const chatBackendRef = useRef<ChatBackend | null>(
+    initialConversationId ? "python" : null,
+  );
+  const persistChatBackend = (backend: ChatBackend) => {
+    chatBackendRef.current = backend;
+    try {
+      sessionStorage.setItem(chatBackendStorageKey, backend);
+    } catch {
+      /* private mode */
+    }
+  };
+  const restoreChatBackend = (): ChatBackend | null => {
+    try {
+      const v = sessionStorage.getItem(chatBackendStorageKey);
+      return v === "python" || v === "node" ? v : null;
+    } catch {
+      return null;
+    }
+  };
+  /** Route follow-ups to Python only when this thread actually started there. */
+  const shouldUsePythonBackend = (): boolean => {
+    const cid =
+      conversationIdRef.current || restorePythonConversationIdFromSession();
+    const backend = resolveChatBackend(
+      chatBackendRef.current ?? restoreChatBackend(),
+      cid,
+      messages,
+      initialConversationId,
+    );
+    return backend === "python";
+  };
   const resolvedFirstName = profile?.firstName?.trim() || undefined;
   const resolvedLastName = profile?.lastName?.trim() || undefined;
   const resolvedFullName =
@@ -391,17 +431,6 @@ export function ConversationView({
     conversationIdRef.current = sid;
     return sid;
   };
-  const messagesSuggestPythonStateMachine = (): boolean =>
-    messages.some(
-      (m) =>
-        m.role === "assistant" &&
-        (/Should I proceed with the call/i.test(m.content) ||
-          /Please confirm/i.test(m.content) ||
-          /Medical Insurance card/i.test(m.content) ||
-          /I'll call that number/i.test(m.content) ||
-          /\*\*Talking points\*\*/.test(m.content)),
-    );
-
   const [inputValue, setInputValue] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<
     PendingAttachment[]
@@ -427,7 +456,10 @@ export function ConversationView({
 
   useEffect(() => {
     const id = initialConversationId?.trim();
-    if (id) seedPythonConversationIdCache(userId, id);
+    if (id) {
+      seedPythonConversationIdCache(userId, id);
+      persistChatBackend("python");
+    }
   }, [userId, initialConversationId]);
 
   useEffect(() => {
@@ -663,6 +695,7 @@ export function ConversationView({
               conversation_id: pythonData.conversation_id,
               debug_state: pythonData.debug_state,
             });
+          persistChatBackend("python");
           if (pythonData.conversation_id)
             persistPythonConversationId(pythonData.conversation_id);
           const assistantMessage: Message = {
@@ -692,6 +725,7 @@ export function ConversationView({
           console.log(
             "[History] First message: Python backend failed or unavailable, falling back to Node/OpenAI",
           );
+        persistChatBackend("node");
         const data = await getChatResponse(
           [{ role: "user", content: initialMessage }],
           chatOpts,
@@ -879,8 +913,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
 
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(buttonLabel));
-    const cid = resolvePythonConversationIdForSend();
-    if (cid || messagesSuggestPythonStateMachine()) {
+    if (shouldUsePythonBackend()) {
+      const cid = resolvePythonConversationIdForSend();
       const data = await sendChatMessage(userId, buttonLabel, cid ?? undefined, {
         callBackendToken: callBackendToken ?? undefined,
         personalProfile: personalProfilePayload,
@@ -963,8 +997,8 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(composedText));
 
-    const cid = resolvePythonConversationIdForSend();
-    if (cid || messagesSuggestPythonStateMachine()) {
+    if (shouldUsePythonBackend()) {
+      const cid = resolvePythonConversationIdForSend();
       const data = await sendChatMessage(userId, composedText, cid ?? undefined, {
         callBackendToken: callBackendToken ?? undefined,
         attachments: attachmentsForSend,
@@ -1347,6 +1381,7 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
         selected.map((opt) => opt.location_query || opt.name).join(" "),
       ),
     );
+    persistChatBackend("python");
     const cid = resolvePythonConversationIdForSend();
     const data = await sendChatMessage(
       userId,
@@ -1393,6 +1428,7 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, newUserMessage]);
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(newUserMessage.content));
+    persistChatBackend("python");
     const cid = resolvePythonConversationIdForSend();
     const data = await sendChatMessage(userId, callPrompt, cid || undefined, {
       callBackendToken: callBackendToken ?? undefined,
@@ -1439,6 +1475,7 @@ Feel free to navigate away — I'll keep working in the background! 🐶`,
     setMessages((prev) => [...prev, newUserMessage]);
     setIsThinking(true);
     setThinkingSteps(buildProcessSteps(newUserMessage.content));
+    persistChatBackend("python");
     const cid = resolvePythonConversationIdForSend();
     const data = await sendChatMessage(
       userId,

@@ -61,7 +61,7 @@ from app.services.state_machine import (
     is_positive_confirmation,
     transition as hospital_transition,
 )
-from app.services.state_machine import _is_yes, _normalize_phone
+from app.services.state_machine import _is_no, _is_yes, _normalize_phone
 from app.services.call_placement import (
     build_call_backend_payload,
     call_backend_configured,
@@ -73,6 +73,17 @@ from app.services.task_service import create_task, update_task
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
+
+# States where the user is answering Yes/No (or amending) on a pending outbound call.
+_CALL_CONFIRM_STATES = frozenset({
+    ReturnFlowState.AWAITING_CALL_CONFIRM.value,
+    ReturnFlowState.AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM.value,
+    ConversationState.AWAITING_CALL_CONFIRM.value,
+})
+
+
+def _awaiting_outbound_call_confirm(state_str: str) -> bool:
+    return state_str in _CALL_CONFIRM_STATES
 
 # Do not use bare \bphone\b — attachment summaries contain "billing phone:" and would falsely
 # trigger direct-call before bill-dispute prefill. Allow "phone 945..." as imperative.
@@ -1205,6 +1216,30 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 conversation_history or None,
             )
 
+    # Yes/No on call confirm must not re-run Layer 1 (it often re-labels "yes" as a new return call).
+    if (
+        new_state is None
+        and not at_entry_no_flow
+        and _awaiting_outbound_call_confirm(current_state_str)
+        and (_is_yes(message) or _is_no(message))
+    ):
+        if is_return_flow_state(current_state_str):
+            new_state, updated_context, reply_text, ui_options = return_transition(
+                ReturnFlowState(current_state_str),
+                message,
+                context,
+                conversation_history or None,
+            )
+        else:
+            hospital_state = (
+                state
+                if isinstance(state, ConversationState)
+                else ConversationState(current_state_str)
+            )
+            new_state, updated_context, reply_text, ui_options = hospital_transition(
+                hospital_state, message, context, user_id, conversation_history or None
+            )
+
     if new_state is None:
         route = route_flow(
             message,
@@ -1300,10 +1335,8 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                 # waiting for Yes/No on a pending outbound call. In that case Layer 1 often labels
                 # follow-ups ("add this detail", "speak Chinese?") as chat; those must stay in
                 # the confirm flow so the state machine (and optional LLM merge) can update context.
-                _stay_in_call_confirm = in_flow and current_state_str in (
-                    ReturnFlowState.AWAITING_CALL_CONFIRM.value,
-                    ReturnFlowState.AWAITING_MEDICAL_INSURANCE_CARD_CONFIRM.value,
-                    ConversationState.AWAITING_CALL_CONFIRM.value,
+                _stay_in_call_confirm = in_flow and _awaiting_outbound_call_confirm(
+                    current_state_str
                 )
                 if not _stay_in_call_confirm:
                     new_state = ConversationState.AWAITING_ZIP
@@ -1315,19 +1348,27 @@ def post_chat(body: ChatRequest, request: Request) -> dict:
                     )
                     ui_options = None
             elif route.is_high_confidence() and route.execution_mode == EXECUTION_CALL:
-                switch_flow_type = layer1_to_flow_type(route)
-                if switch_flow_type is not None and switch_flow_type != current_flow_type:
-                    # Switch flow: terminate previous, start new
-                    context["flow_type"] = switch_flow_type
-                    if switch_flow_type in (FLOW_RETURN_SERVICE, FLOW_GENERAL_BUSINESS_QUOTE, FLOW_GENERAL_CALL):
-                        return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
-                        new_state, updated_context, reply_text, ui_options = return_transition(
-                            return_state, message, context, conversation_history or None
-                        )
-                    else:
-                        new_state, updated_context, reply_text, ui_options = hospital_transition(
-                            state, message, context, user_id, conversation_history or None
-                        )
+                if not (
+                    in_flow
+                    and _awaiting_outbound_call_confirm(current_state_str)
+                ):
+                    switch_flow_type = layer1_to_flow_type(route)
+                    if switch_flow_type is not None and switch_flow_type != current_flow_type:
+                        # Switch flow: terminate previous, start new
+                        context["flow_type"] = switch_flow_type
+                        if switch_flow_type in (
+                            FLOW_RETURN_SERVICE,
+                            FLOW_GENERAL_BUSINESS_QUOTE,
+                            FLOW_GENERAL_CALL,
+                        ):
+                            return_state = ReturnFlowState.AWAITING_PHONE_OR_ZIP
+                            new_state, updated_context, reply_text, ui_options = return_transition(
+                                return_state, message, context, conversation_history or None
+                            )
+                        else:
+                            new_state, updated_context, reply_text, ui_options = hospital_transition(
+                                state, message, context, user_id, conversation_history or None
+                            )
                 # else: continue in current flow (new_state stays None)
             # else: medium/low confidence — continue in flow (new_state stays None)
 

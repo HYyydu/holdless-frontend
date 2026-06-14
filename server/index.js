@@ -18,6 +18,10 @@ import { fileURLToPath } from "url";
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import {
+  conversationInCallPlacementFlow,
+  userConfirmingPendingCall,
+} from "./callPlacementFlow.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.join(__dirname, "..", "dist");
@@ -1373,10 +1377,13 @@ app.post("/api/chat", async (req, res) => {
     /call\s+(?:that\s+)?number|help\s+me\s+call|(?:can\s+)?(?:u|you)\s+call|just\s+(?:help\s+me\s+)?call|call\s+(?:\d|[\d\s\-\(\)]{7,})/i.test(
       lastUserContent,
     );
-  // If "call" + phone number in same message, or any call phrase → treat as call request
   const callBackendAvailable = !!USE_CALL_BACKEND;
+  const inCallPlacementFlow = conversationInCallPlacementFlow(messages);
+  const confirmingCall = userConfirmingPendingCall(messages, lastUserContent);
+  // If "call" + phone number in same message, call phrase, or Yes after confirm → call flow
   const hasCallRequest =
-    callBackendAvailable && ((hasCallWord && hasPhoneNumber) || hasCallPhrase);
+    callBackendAvailable &&
+    ((hasCallWord && hasPhoneNumber) || hasCallPhrase || confirmingCall);
 
   console.log("[Call] lastUserContent:", lastUserContent.slice(0, 80));
   console.log("[Call] call detection:", {
@@ -1386,15 +1393,29 @@ app.post("/api/chat", async (req, res) => {
     callBackendAvailable,
     CALL_BACKEND_URL_set: !!CALL_BACKEND_URL,
     hasCallRequest,
+    inCallPlacementFlow,
+    confirmingCall,
   });
 
-  // When call requested: pass ONLY place_call so model can confirm first, then call after user says Yes (use 'auto', do not force)
-  const toolsToUse = hasCallRequest
-    ? TOOLS.filter((t) => t.function.name === "place_call")
-    : GOOGLE_PLACES_API_KEY || callBackendAvailable
-      ? TOOLS
-      : undefined;
-  const toolChoice = toolsToUse ? "auto" : undefined;
+  if (confirmingCall) {
+    openaiMessages.push({
+      role: "system",
+      content:
+        "The user confirmed they want the call placed. Invoke place_call NOW using the phone number, caller name, and call reason already collected in this thread. Do not greet, restart the flow, or ask again.",
+    });
+  }
+
+  // During call placement (initial request, name reply, or final Yes), offer place_call only.
+  const toolsToUse =
+    (hasCallRequest || inCallPlacementFlow) && callBackendAvailable
+      ? TOOLS.filter((t) => t.function.name === "place_call")
+      : GOOGLE_PLACES_API_KEY || callBackendAvailable
+        ? TOOLS
+        : undefined;
+  let toolChoice = toolsToUse ? "auto" : undefined;
+  if (confirmingCall && toolsToUse?.some((t) => t.function.name === "place_call")) {
+    toolChoice = { type: "function", function: { name: "place_call" } };
+  }
 
   try {
     console.log(
